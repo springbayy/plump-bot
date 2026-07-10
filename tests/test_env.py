@@ -6,6 +6,19 @@ from plump.state import BidAction, EventType, GameConfig, IllegalActionError, Ph
 
 
 class EnvTest(unittest.TestCase):
+    def test_clone_is_independent_and_preserves_decision_state(self):
+        env = PlumpEnv(GameConfig(num_players=3, hand_sizes=[3]), seed=41)
+        env.reset()
+        clone = env.clone()
+
+        self.assertEqual(clone.phase(), env.phase())
+        self.assertEqual(clone.current_player(), env.current_player())
+        self.assertEqual(clone.legal_actions(), env.legal_actions())
+        clone.step(clone.legal_actions()[0])
+
+        self.assertEqual(len(env.state.current_round.bids), 0)
+        self.assertEqual(len(clone.state.current_round.bids), 1)
+
     def test_illegal_play_rejected_when_player_can_follow_suit(self):
         hands = {
             0: [Card(Suit.SPADES, Rank.ACE), Card(Suit.CLUBS, Rank.TWO)],
@@ -94,6 +107,48 @@ class EnvTest(unittest.TestCase):
         self.assertEqual(obs0.legal_bids, [0, 1])
         self.assertEqual(obs0.played_cards_total, [])
         self.assertFalse(any(Card(Suit.HEARTS, Rank.KING) in cards for cards in obs0.played_cards_by_player.values()))
+
+    def test_config_can_override_bidding_start_player(self):
+        env = PlumpEnv(GameConfig(num_players=4, hand_sizes=[1], bidding_start_players=[2]))
+        state = env.reset()
+
+        self.assertEqual(state.current_round.bidding_start_player, 2)
+        self.assertEqual(state.current_round.bidding_order, [2, 3, 0, 1])
+        self.assertEqual(env.current_player(), 2)
+
+    def test_default_game_has_no_trump(self):
+        env = PlumpEnv(GameConfig(num_players=4, hand_sizes=[1]), seed=1)
+        state = env.reset()
+
+        self.assertIsNone(state.current_round.trump_suit)
+
+    def test_default_no_trump_off_suit_card_cannot_win(self):
+        hands = {
+            0: [Card(Suit.CLUBS, Rank.SEVEN)],
+            1: [Card(Suit.CLUBS, Rank.FOUR)],
+            2: [Card(Suit.CLUBS, Rank.EIGHT)],
+            3: [Card(Suit.DIAMONDS, Rank.FIVE)],
+        }
+        env = PlumpEnv(
+            GameConfig(
+                num_players=4,
+                hand_sizes=[1],
+                manual_hands=hands,
+                bidding_start_players=[0],
+                forbid_total_bid_equals_hand_size=False,
+            )
+        )
+        env.reset()
+        env.step(BidAction(0, 1))
+        env.step(BidAction(1, 0))
+        env.step(BidAction(2, 0))
+        env.step(BidAction(3, 0))
+        env.step(PlayCardAction(0, Card(Suit.CLUBS, Rank.SEVEN)))
+        env.step(PlayCardAction(1, Card(Suit.CLUBS, Rank.FOUR)))
+        env.step(PlayCardAction(2, Card(Suit.CLUBS, Rank.EIGHT)))
+        result = env.step(PlayCardAction(3, Card(Suit.DIAMONDS, Rank.FIVE)))
+
+        self.assertEqual(result.state.rounds[0].tricks[0].winner, 2)
 
 
 if __name__ == "__main__":

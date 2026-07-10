@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Plump</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="app">
+      <section id="setup" class="setup">
+        <div>
+          <p class="eyebrow">Plump</p>
+          <h1>Play a round</h1>
+        </div>
+        <form id="setup-form" class="setup-grid">
+          <label>
+            Opponents
+            <select name="opponents" id="opponents">
+              <option value="2">2 opponents</option>
+              <option value="3" selected>3 opponents</option>
+              <option value="4">4 opponents</option>
+            </select>
+          </label>
+          <label>
+            Cards this round
+            <input name="hand_size" id="hand-size" type="number" min="3" max="10" value="5" />
+          </label>
+          <label>
+            Your bid order
+            <select name="bid_position" id="bid-position"></select>
+          </label>
+          <label>
+            Seed
+            <input name="seed" type="number" placeholder="random" />
+          </label>
+          <button class="primary" type="submit">Start Round</button>
+        </form>
+      </section>
+
+      <section id="table" class="table hidden">
+        <header class="topbar">
+          <div>
+            <p class="eyebrow">Current Round</p>
+            <h1 id="phase-title">Bidding</h1>
+          </div>
+          <div class="stats">
+            <span id="trump-pill" class="pill">Trump</span>
+            <span id="hand-pill" class="pill">Cards</span>
+            <span id="turn-pill" class="pill strong">Turn</span>
+          </div>
+        </header>
+
+        <section class="layout">
+          <aside class="panel players-panel">
+            <div class="panel-head">
+              <h2>Players</h2>
+              <button id="new-round" class="icon-button" title="Start another round">↻</button>
+            </div>
+            <div id="players" class="players"></div>
+          </aside>
+
+          <section class="play-area">
+            <div class="panel trick-panel">
+              <div class="panel-head">
+                <h2>Current Trick</h2>
+                <span id="leader-label" class="subtle"></span>
+              </div>
+              <div id="trick" class="trick"></div>
+            </div>
+
+            <div id="action-panel" class="panel action-panel"></div>
+
+            <div class="panel hand-panel">
+              <div class="panel-head">
+                <h2>Your Hand</h2>
+                <span id="legal-hint" class="subtle"></span>
+              </div>
+              <div id="hand" class="hand"></div>
+            </div>
+          </section>
+
+          <aside class="panel log-panel">
+            <div class="panel-head">
+              <h2>History</h2>
+            </div>
+            <div id="messages" class="messages"></div>
+            <div id="events" class="events"></div>
+          </aside>
+        </section>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

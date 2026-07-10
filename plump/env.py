@@ -73,6 +73,66 @@ class PlumpEnv:
         self._start_round(0)
         return self.state
 
+    def clone(self) -> "PlumpEnv":
+        """Copy mutable game state without recursively copying configuration."""
+
+        clone = object.__new__(PlumpEnv)
+        clone.config = self.config
+        clone.rng = random.Random()
+        clone.rng.setstate(self.rng.getstate())
+        clone.state = GameState(
+            config=self.config,
+            phase=self.state.phase,
+            round_index=self.state.round_index,
+            current_player=self.state.current_player,
+            cumulative_scores=dict(self.state.cumulative_scores),
+            rounds=[
+                RoundState(
+                    round_index=round_state.round_index,
+                    hand_size=round_state.hand_size,
+                    trump_suit=round_state.trump_suit,
+                    bidding_start_player=(
+                        round_state.bidding_start_player
+                    ),
+                    bidding_order=round_state.bidding_order,
+                    play_start_player=round_state.play_start_player,
+                    initial_hands=round_state.initial_hands,
+                    current_hands={
+                        player: list(hand)
+                        for player, hand in (
+                            round_state.current_hands.items()
+                        )
+                    },
+                    bids=list(round_state.bids),
+                    tricks=[
+                        Trick(
+                            trick_index=trick.trick_index,
+                            leader=trick.leader,
+                            led_suit=trick.led_suit,
+                            plays=list(trick.plays),
+                            winner=trick.winner,
+                        )
+                        for trick in round_state.tricks
+                    ],
+                    tricks_won=dict(round_state.tricks_won),
+                    round_scores=dict(round_state.round_scores),
+                    cumulative_scores_after_round=dict(
+                        round_state.cumulative_scores_after_round
+                    ),
+                )
+                for round_state in self.state.rounds
+            ],
+            event_log=list(self.state.event_log),
+        )
+        for name in (
+            "_deck_override",
+            "_hands_override",
+            "_trump_override",
+        ):
+            if hasattr(self, name):
+                setattr(clone, name, getattr(self, name))
+        return clone
+
     def current_player(self) -> int:
         if self.state.current_player is None:
             raise RuntimeError("There is no current player.")
@@ -113,9 +173,14 @@ class PlumpEnv:
                 player_id=player_id,
                 phase=self.state.phase,
                 round_index=self.state.round_index,
+                total_rounds=len(self.config.hand_sizes),
+                rounds_remaining=len(self.config.hand_sizes),
                 hand_size=0,
                 trump_suit=None,
                 current_player=self.state.current_player,
+                bidding_start_player=0,
+                bidding_order=[],
+                play_start_player=None,
                 my_hand=[],
                 bids=[],
                 tricks_won={player: 0 for player in range(self.config.num_players)},
@@ -128,6 +193,7 @@ class PlumpEnv:
                 legal_cards=[],
                 scores=dict(self.state.cumulative_scores),
                 event_log=list(self.state.event_log),
+                hand_size_schedule=list(self.config.hand_sizes),
             )
 
         round_state = self.state.current_round
@@ -152,9 +218,14 @@ class PlumpEnv:
             player_id=player_id,
             phase=self.state.phase,
             round_index=round_state.round_index,
+            total_rounds=len(self.config.hand_sizes),
+            rounds_remaining=max(len(self.config.hand_sizes) - round_state.round_index - 1, 0),
             hand_size=round_state.hand_size,
             trump_suit=round_state.trump_suit,
             current_player=self.state.current_player,
+            bidding_start_player=round_state.bidding_start_player,
+            bidding_order=list(round_state.bidding_order),
+            play_start_player=round_state.play_start_player,
             my_hand=sort_cards(round_state.current_hands.get(player_id, [])),
             bids=list(round_state.bids),
             tricks_won=dict(round_state.tricks_won),
@@ -167,6 +238,7 @@ class PlumpEnv:
             legal_cards=legal_card_values,
             scores=dict(self.state.cumulative_scores),
             event_log=list(self.state.event_log),
+            hand_size_schedule=list(self.config.hand_sizes),
         )
 
     def _step_bid(self, action: BidAction) -> StepResult:
@@ -297,7 +369,10 @@ class PlumpEnv:
 
     def _start_round(self, round_index: int) -> None:
         hand_size = self.config.hand_sizes[round_index]
-        start_player = round_index % self.config.num_players
+        if self.config.bidding_start_players and round_index < len(self.config.bidding_start_players):
+            start_player = self.config.bidding_start_players[round_index]
+        else:
+            start_player = round_index % self.config.num_players
         order = bidding_order(start_player, self.config.num_players)
         initial_hands, trump_suit = self._deal_round(hand_size)
         round_state = RoundState(
@@ -403,6 +478,11 @@ class PlumpEnv:
                 raise ValueError("Hand sizes must be positive.")
             if hand_size > max_hand_size:
                 raise ValueError(f"Hand size {hand_size} is too large for {self.config.num_players} players.")
+        if self.config.bidding_start_players is not None:
+            if len(self.config.bidding_start_players) > len(self.config.hand_sizes):
+                raise ValueError("bidding_start_players cannot be longer than hand_sizes.")
+            for player in self.config.bidding_start_players:
+                self._validate_player(player)
 
     def _validate_player(self, player_id: int) -> None:
         if player_id < 0 or player_id >= self.config.num_players:

@@ -55,11 +55,12 @@ class GameConfig:
     )
     forbid_total_bid_equals_hand_size: bool = True
     scoring: ScoringConfig = field(default_factory=ScoringConfig)
-    trump_policy: TrumpPolicy = TrumpPolicy.REVEAL_NEXT_CARD
+    trump_policy: TrumpPolicy = TrumpPolicy.NONE
     shuffle: bool = True
     deck_order: Optional[list[Card]] = None
     manual_hands: Optional[dict[int, list[Card]]] = None
     manual_trump_suit: Optional[Suit] = None
+    bidding_start_players: Optional[list[int]] = None
     auto_advance_rounds: bool = True
 
 
@@ -153,9 +154,14 @@ class Observation:
     player_id: int
     phase: Phase
     round_index: int
+    total_rounds: int
+    rounds_remaining: int
     hand_size: int
     trump_suit: Optional[Suit]
     current_player: Optional[int]
+    bidding_start_player: int
+    bidding_order: list[int]
+    play_start_player: Optional[int]
     my_hand: list[Card]
     bids: list[Bid]
     tricks_won: dict[int, int]
@@ -168,6 +174,7 @@ class Observation:
     legal_cards: list[Card]
     scores: dict[int, int]
     event_log: list[GameEvent]
+    hand_size_schedule: list[int]
 
 
 @dataclass

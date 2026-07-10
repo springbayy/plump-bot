@@ -1,0 +1,36 @@
+[project]
+name = "plump-bot"
+version = "0.1.0"
+description = "Plump game engine and neural model architecture."
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "matplotlib>=3.10.9",
+    "numpy>=2.0",
+    "torch>=2.13.0.dev0; sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.uv]
+package = false
+prerelease = "explicit"
+environments = [
+    "sys_platform == 'darwin' and platform_machine == 'arm64'",
+]
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-nightly", marker = "sys_platform == 'darwin' and platform_machine == 'arm64'" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-nightly"
+url = "https://download.pytorch.org/whl/nightly/cpu"
+explicit = true
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
