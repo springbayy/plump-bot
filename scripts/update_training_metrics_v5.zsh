@@ -9,7 +9,7 @@ while true; do
   if [[ -f "$run_dir/metrics.csv" ]]; then
     "$repo_dir/.venv/bin/python" examples/plot_search_metrics.py \
       "$run_dir" --smooth 5 \
-      >> "$run_dir/metrics_update.log" 2>&1
+      >> "$run_dir/metrics_update.log" 2>&1 || true
   fi
   sleep 60
 done
