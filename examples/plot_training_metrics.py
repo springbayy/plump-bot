@@ -482,7 +482,7 @@ def _plot_throughput(
     x: list[float],
     smooth: int,
 ) -> None:
-    """Progress per wall-clock: decisions/second and cumulative decisions."""
+    """Progress per wall-clock: decisions/second."""
 
     samples = _series(rows, "samples")
     iteration_seconds = _series(rows, "iteration_sec")
@@ -502,29 +502,8 @@ def _plot_throughput(
             label="decisions / second",
             color="tab:blue",
         )
-        ax.set_ylabel("decisions / second", color="tab:blue")
-        ax.tick_params(axis="y", labelcolor="tab:blue")
+        ax.set_ylabel("decisions / second")
         ax.set_ylim(bottom=0.0)
-        plotted = True
-
-    if _has_data(samples):
-        cumulative: list[float] = []
-        total = 0.0
-        for sample_count in samples:
-            if not math.isnan(sample_count):
-                total += sample_count
-            cumulative.append(total / 1e6)
-        twin = ax.twinx()
-        twin.plot(
-            x,
-            cumulative,
-            label="cumulative decisions (M)",
-            color="tab:orange",
-            alpha=0.8,
-        )
-        twin.set_ylabel("cumulative decisions (M)", color="tab:orange")
-        twin.tick_params(axis="y", labelcolor="tab:orange")
-        twin.set_ylim(bottom=0.0)
         plotted = True
 
     ax.set_title("Throughput")
