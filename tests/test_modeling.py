@@ -66,6 +66,217 @@ def _env_with_history(rotation=0):
 
 
 class ModelingEncodingTest(unittest.TestCase):
+    def test_five_player_ten_card_decision_history_tops_out_at_64_events(self):
+        env = PlumpEnv(
+            GameConfig(
+                num_players=5,
+                hand_sizes=[10],
+                forbid_total_bid_equals_hand_size=False,
+            ),
+            seed=17,
+        )
+        env.reset()
+        decision_lengths = []
+        while not env.is_done():
+            observation = env.get_observation(env.current_player())
+            decision_lengths.append(
+                sum(
+                    event.round_index == observation.round_index
+                    for event in observation.event_log
+                )
+            )
+            env.step(env.legal_actions()[0])
+
+        self.assertEqual(max(decision_lengths), 64)
+
+    def test_event_buckets_never_truncate_and_fall_back_above_64(self):
+        config = ModelConfig(max_seq_len=100)
+        encoded = encode_observation(
+            _env_with_history().get_observation(1),
+            config,
+        )
+        for valid_length, expected_length in (
+            (6, 8),
+            (9, 16),
+            (17, 32),
+            (33, 64),
+            (65, 100),
+        ):
+            candidate = copy.deepcopy(encoded)
+            candidate.event_valid_mask = [
+                index < valid_length for index in range(config.max_seq_len)
+            ]
+            batch = encoded_observations_to_batch(
+                [candidate],
+                device="cpu",
+                event_length_buckets=(8, 16, 32, 64),
+            )
+            self.assertEqual(batch.max_valid_event_length, valid_length)
+            self.assertEqual(batch.event_length, expected_length)
+            self.assertEqual(int(batch.event_valid_mask.sum()), valid_length)
+
+    def test_torch_and_numpy_batch_packing_match(self):
+        import torch
+
+        config = ModelConfig(max_seq_len=32)
+        observations = [
+            encode_observation(
+                _env_with_history().get_observation(1),
+                config,
+                include_game_context=include_game_context,
+            )
+            for include_game_context in (False, True)
+        ]
+        torch_batch = encoded_observations_to_batch(
+            observations,
+            device="cpu",
+            event_length_buckets=(8, 16, 32, 64),
+            packing="torch",
+        )
+        numpy_batch = encoded_observations_to_batch(
+            observations,
+            device="cpu",
+            event_length_buckets=(8, 16, 32, 64),
+            packing="numpy",
+        )
+        for field in torch_batch.__dataclass_fields__:
+            expected = getattr(torch_batch, field)
+            actual = getattr(numpy_batch, field)
+            if isinstance(expected, torch.Tensor):
+                self.assertTrue(torch.equal(expected, actual), field)
+            else:
+                self.assertEqual(expected, actual, field)
+
+    def test_bucketed_and_lean_forwards_match_full_outputs_and_gradients(self):
+        import torch
+
+        torch.manual_seed(23)
+        config = ModelConfig(
+            max_seq_len=32,
+            d_model=32,
+            n_layers=1,
+            n_heads=4,
+            d_ff=64,
+            context_hidden_dim=64,
+            game_hidden_dim=32,
+            schedule_heads=4,
+            dropout=0.0,
+            oracle_critic=True,
+        )
+        observation = _env_with_history().get_observation(1)
+        encoded = [
+            encode_observation(
+                observation,
+                config,
+                include_game_context=include_game_context,
+            )
+            for include_game_context in (False, True)
+        ]
+        full_batch = encoded_observations_to_batch(encoded, device="cpu")
+        bucketed_batch = encoded_observations_to_batch(
+            encoded,
+            device="cpu",
+            event_length_buckets=(8, 16, 32, 64),
+        )
+        owner_targets = torch.full((2, 52), -100, dtype=torch.long)
+        for batch_index, row_mask in enumerate(encoded):
+            for card_index, valid_classes in enumerate(row_mask.owner_valid_mask):
+                if any(valid_classes):
+                    owner_targets[batch_index, card_index] = valid_classes.index(True)
+
+        model = PlumpTransformerModel(config).eval()
+        full = model(full_batch, privileged_owner_targets=owner_targets)
+        bucketed = model(bucketed_batch, privileged_owner_targets=owner_targets)
+        for field in (
+            "bid_logits",
+            "card_logits",
+            "masked_bid_logits",
+            "masked_card_logits",
+            "value",
+            "round_value",
+            "game_value",
+            "oracle_value",
+            "trick_count_logits",
+            "masked_trick_count_logits",
+        ):
+            torch.testing.assert_close(
+                getattr(bucketed, field),
+                getattr(full, field),
+                atol=2e-5,
+                rtol=2e-5,
+            )
+
+        policy = model.forward_policy(bucketed_batch)
+        rollout = model.forward_rollout(
+            bucketed_batch,
+            privileged_owner_targets=owner_targets,
+        )
+        for lean, expected in (
+            (policy.masked_bid_logits, bucketed.masked_bid_logits),
+            (policy.masked_card_logits, bucketed.masked_card_logits),
+            (rollout.masked_bid_logits, bucketed.masked_bid_logits),
+            (rollout.masked_card_logits, bucketed.masked_card_logits),
+            (rollout.value, bucketed.value),
+            (rollout.oracle_value, bucketed.oracle_value),
+            (
+                rollout.masked_trick_count_logits,
+                bucketed.masked_trick_count_logits,
+            ),
+        ):
+            torch.testing.assert_close(lean, expected, atol=2e-5, rtol=2e-5)
+
+        # A mixed context batch must retain the exact per-row full-forward
+        # behavior, including selecting the round head for the local row and
+        # the game head for the context-enabled row.
+        for index in range(2):
+            individual = model(
+                encoded_observations_to_batch([encoded[index]], device="cpu"),
+                privileged_owner_targets=owner_targets[index : index + 1],
+            )
+            torch.testing.assert_close(
+                bucketed.value[index],
+                individual.value[0],
+                atol=2e-5,
+                rtol=2e-5,
+            )
+
+        def objective(output):
+            return (
+                output.bid_logits.sum()
+                + output.card_logits.sum()
+                + output.value.sum()
+                + output.oracle_value.sum()
+                + output.trick_count_logits.sum()
+            )
+
+        model.zero_grad(set_to_none=True)
+        objective(
+            model(full_batch, privileged_owner_targets=owner_targets)
+        ).backward()
+        full_gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        model.zero_grad(set_to_none=True)
+        objective(
+            model(bucketed_batch, privileged_owner_targets=owner_targets)
+        ).backward()
+        bucketed_gradients = {
+            name: parameter.grad.detach().clone()
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+        }
+        self.assertEqual(set(full_gradients), set(bucketed_gradients))
+        for name in full_gradients:
+            torch.testing.assert_close(
+                bucketed_gradients[name],
+                full_gradients[name],
+                atol=5e-5,
+                rtol=5e-5,
+                msg=lambda message, name=name: f"{name}: {message}",
+            )
+
     def test_schema_v4_shapes_masks_capacities_and_reserved_context(self):
         env = _env_with_history()
         config = ModelConfig(max_seq_len=32)
@@ -489,6 +700,147 @@ class ModelingEncodingTest(unittest.TestCase):
             )
         )
         self.assertFalse(torch.allclose(probabilities[0], probabilities[1]))
+
+class OracleCriticModelTest(unittest.TestCase):
+    def _config(self, *, oracle_critic: bool) -> ModelConfig:
+        return ModelConfig(
+            max_seq_len=32,
+            d_model=32,
+            n_layers=1,
+            n_heads=4,
+            d_ff=64,
+            context_hidden_dim=64,
+            oracle_critic=oracle_critic,
+        )
+
+    def test_oracle_head_is_gated_by_config(self):
+        plain = PlumpTransformerModel(self._config(oracle_critic=False))
+        self.assertFalse(
+            [name for name, _ in plain.named_parameters() if name.startswith("oracle_")]
+        )
+        oracle = PlumpTransformerModel(self._config(oracle_critic=True))
+        self.assertTrue(
+            [name for name, _ in oracle.named_parameters() if name.startswith("oracle_")]
+        )
+
+    def test_oracle_value_requires_head_and_targets(self):
+        import torch
+
+        config = self._config(oracle_critic=True)
+        encoded = encode_observation(
+            _env_with_history().get_observation(1),
+            config,
+        )
+        batch = encoded_observations_to_batch([encoded], device="cpu")
+        model = PlumpTransformerModel(config)
+        targets = torch.full((1, 52), -100, dtype=torch.long)
+        targets[0, card_id(Card(Suit.DIAMONDS, Rank.ACE))] = 0
+        targets[0, card_id(Card(Suit.SPADES, Rank.TWO))] = 1
+
+        output = model(batch, privileged_owner_targets=targets)
+        self.assertEqual(output.oracle_value.shape, (1, 1))
+        self.assertTrue(torch.isfinite(output.oracle_value).all())
+        self.assertIsNone(model(batch).oracle_value)
+
+        plain = PlumpTransformerModel(self._config(oracle_critic=False))
+        with self.assertRaises(ValueError):
+            plain(batch, privileged_owner_targets=targets)
+
+    def test_oracle_value_depends_on_privileged_targets_not_policy(self):
+        import torch
+
+        config = self._config(oracle_critic=True)
+        encoded = encode_observation(
+            _env_with_history().get_observation(1),
+            config,
+        )
+        batch = encoded_observations_to_batch([encoded], device="cpu")
+        model = PlumpTransformerModel(config)
+        # Same class counts, swapped card-to-owner assignment: only the
+        # private "who holds what" association differs. A pooling that
+        # collapses to public information would leave the output unchanged.
+        ace = card_id(Card(Suit.DIAMONDS, Rank.ACE))
+        deuce = card_id(Card(Suit.SPADES, Rank.TWO))
+        targets_a = torch.full((1, 52), -100, dtype=torch.long)
+        targets_a[0, ace] = 0
+        targets_a[0, deuce] = 1
+        targets_b = torch.full((1, 52), -100, dtype=torch.long)
+        targets_b[0, ace] = 1
+        targets_b[0, deuce] = 0
+
+        output_a = model(batch, privileged_owner_targets=targets_a)
+        output_b = model(batch, privileged_owner_targets=targets_b)
+        self.assertFalse(
+            torch.allclose(output_a.oracle_value, output_b.oracle_value)
+        )
+        # The policy and plain value must be unaffected by privileged inputs.
+        self.assertTrue(torch.equal(output_a.bid_logits, output_b.bid_logits))
+        self.assertTrue(torch.equal(output_a.card_logits, output_b.card_logits))
+        self.assertTrue(torch.equal(output_a.value, output_b.value))
+
+    def test_v4_warm_start_drops_oracle_head_weights(self):
+        from plump.modeling.torch_model import PlumpSearchModel, load_v4_weights
+
+        source = PlumpTransformerModel(self._config(oracle_critic=True))
+        target = PlumpSearchModel(self._config(oracle_critic=False))
+
+        migration = load_v4_weights(target, source.state_dict())
+
+        self.assertTrue(migration["dropped"])
+        self.assertTrue(
+            all(key.startswith("oracle_") for key in migration["dropped"])
+        )
+        self.assertTrue(
+            all(
+                key.startswith(("bid_q_head.", "card_q_head."))
+                for key in migration["fresh"]
+            )
+        )
+
+    def test_suit_presence_head_gated_and_dropped_on_v4_warm_start(self):
+        import dataclasses
+
+        import torch
+
+        from plump.modeling.torch_model import PlumpSearchModel, load_v4_weights
+
+        config = dataclasses.replace(
+            self._config(oracle_critic=False),
+            suit_presence_head=True,
+        )
+        model = PlumpTransformerModel(config)
+        self.assertTrue(
+            [
+                name
+                for name, _ in model.named_parameters()
+                if name.startswith("suit_presence_head.")
+            ]
+        )
+        encoded = encode_observation(
+            _env_with_history().get_observation(1),
+            config,
+        )
+        batch = encoded_observations_to_batch([encoded], device="cpu")
+        output = model(batch)
+        self.assertEqual(
+            output.suit_presence_logits.shape,
+            (1, config.max_players, 4),
+        )
+        self.assertTrue(torch.isfinite(output.suit_presence_logits).all())
+
+        plain = PlumpTransformerModel(self._config(oracle_critic=False))
+        self.assertIsNone(plain(batch).suit_presence_logits)
+
+        target = PlumpSearchModel(self._config(oracle_critic=False))
+        migration = load_v4_weights(target, model.state_dict())
+        self.assertTrue(
+            all(
+                key.startswith("suit_presence_head.")
+                for key in migration["dropped"]
+            )
+        )
+        self.assertTrue(migration["dropped"])
+
 
 if __name__ == "__main__":
     unittest.main()

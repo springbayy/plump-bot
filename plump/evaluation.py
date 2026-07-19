@@ -81,6 +81,7 @@ class ScenarioResult:
     relative_reward: float
     bid_hit: float
     bid_abs_error: float
+    bid_value: float
     first_leader: float
     forward_passes: int
 
@@ -584,6 +585,7 @@ def _scenario_result(row: _ActiveScenario) -> ScenarioResult:
         relative_reward=relative[0],
         bid_hit=float(round_state.tricks_won[0] == bid),
         bid_abs_error=float(abs(round_state.tricks_won[0] - bid)),
+        bid_value=float(bid),
         first_leader=float(round_state.play_start_player == 0),
         forward_passes=row.candidate_forward_passes,
     )

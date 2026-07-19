@@ -6,8 +6,9 @@ import random
 from collections import defaultdict
 from math import comb, exp
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol, Sequence
 
+import numpy as np
 import torch
 from torch.distributions import Categorical
 
@@ -410,6 +411,9 @@ class ModelPolicy:
         greedy: bool = True,
         include_game_context: bool = False,
         precision: str = "fp32",
+        event_length_buckets: Sequence[int] = (),
+        batch_packing: Literal["torch", "numpy"] = "torch",
+        lean_action_forward: bool = False,
         name: str = "model",
     ) -> None:
         self.device = torch.device(device) if device is not None else best_torch_device()
@@ -419,6 +423,9 @@ class ModelPolicy:
         self.greedy = greedy
         self.include_game_context = include_game_context
         self.precision = precision
+        self.event_length_buckets = tuple(event_length_buckets)
+        self.batch_packing = batch_packing
+        self.lean_action_forward = lean_action_forward
         self.name = name
         self.forward_passes = 0
 
@@ -429,6 +436,9 @@ class ModelPolicy:
         *,
         device: str | torch.device | None = None,
         greedy: bool = True,
+        event_length_buckets: Sequence[int] = (),
+        batch_packing: Literal["torch", "numpy"] = "torch",
+        lean_action_forward: bool = False,
         name: str | None = None,
     ) -> "ModelPolicy | LegacyCheckpointPolicy":
         payload = _load_payload(checkpoint_path)
@@ -464,6 +474,9 @@ class ModelPolicy:
                 else False
             ),
             precision=str(payload.get("precision", "fp32")),
+            event_length_buckets=event_length_buckets,
+            batch_packing=batch_packing,
+            lean_action_forward=lean_action_forward,
             name=name or Path(checkpoint_path).stem,
         )
 
@@ -478,17 +491,120 @@ class ModelPolicy:
     ) -> list[BidAction | PlayCardAction]:
         if not envs:
             return []
-        if rngs is None:
-            rngs = [random.Random() for _ in envs]
-        if len(rngs) != len(envs):
-            raise ValueError("rngs must match envs.")
         players = [env.current_player() for env in envs]
         phases = [env.phase() for env in envs]
-        observations = [
-            env.get_observation(player)
+        encoded = [
+            encode_observation(
+                env.get_observation(player),
+                self.model_config,
+                include_game_context=self.include_game_context,
+            )
             for env, player in zip(envs, players)
         ]
-        _, output = self.predict_observations(observations, need_owner=False)
+        return self.act_encoded(encoded, phases=phases, players=players, rngs=rngs)
+
+    def act_encoded(
+        self,
+        encoded: list,
+        *,
+        phases: list[Phase],
+        players: list[int],
+        rngs: list[random.Random] | None = None,
+    ) -> list[BidAction | PlayCardAction]:
+        """Act on pre-encoded observations (e.g. produced in env workers)."""
+
+        if not encoded:
+            return []
+        if rngs is None:
+            rngs = [random.Random() for _ in encoded]
+        if len(rngs) != len(encoded):
+            raise ValueError("rngs must match encoded observations.")
+        output = (
+            self.predict_policy_encoded(encoded)
+            if self.lean_action_forward
+            else self.predict_encoded(encoded, need_owner=False)
+        )
+        return self._actions_from_output(output, phases=phases, players=players, rngs=rngs)
+
+    def act_batch(
+        self,
+        batch,
+        *,
+        phases: list[Phase],
+        players: list[int],
+        rngs: list[random.Random] | None = None,
+    ) -> list[BidAction | PlayCardAction]:
+        """Act on a prebuilt ModelBatch (e.g. one model's group of a pooled wave).
+
+        Unlike ``act_encoded`` this samples on the CPU with vectorized numpy
+        (one device sync per head instead of a mask upload, a GPU softmax, and
+        a Python loop per row), so pooled evaluation waves with many small
+        model groups do not serialize on the GPU queue. Sampling consumes one
+        ``rng.random()`` draw per row, a different stream use than
+        ``act_encoded``'s ``rng.choices`` — statistically equivalent, not
+        bitwise identical.
+        """
+
+        if rngs is None:
+            rngs = [random.Random() for _ in players]
+        if len(rngs) != len(players):
+            raise ValueError("rngs must match batch rows.")
+        with torch.inference_mode(), model_autocast(self.device, self.precision):
+            output = (
+                self.model.forward_policy(batch)
+                if self.lean_action_forward
+                else self.model(batch, need_owner=False)
+            )
+        self.forward_passes += len(players)
+
+        bid_logits = output.masked_bid_logits.float().cpu().numpy()
+        card_logits = output.masked_card_logits.float().cpu().numpy()
+        bidding = np.fromiter(
+            (phase == Phase.BIDDING for phase in phases),
+            dtype=np.bool_,
+            count=len(phases),
+        )
+
+        def sample_indices(logits: np.ndarray, uniforms: np.ndarray) -> np.ndarray:
+            if self.greedy:
+                return logits.argmax(axis=1)
+            stable = logits - logits.max(axis=1, keepdims=True)
+            probabilities = np.exp(stable)
+            probabilities /= probabilities.sum(axis=1, keepdims=True)
+            cumulative = np.cumsum(probabilities, axis=1)
+            selected = (cumulative < uniforms[:, None]).sum(axis=1)
+            # Rounding can leave the final cumulative a hair under the draw;
+            # the overflow index would be out of range or a masked action, so
+            # clip to each row's last positive-probability index.
+            last_legal = (probabilities > 0).cumsum(axis=1).argmax(axis=1)
+            return np.minimum(selected, last_legal)
+
+        uniforms = np.fromiter(
+            (rng.random() for rng in rngs), dtype=np.float64, count=len(rngs)
+        )
+        indices = np.empty(len(players), dtype=np.int64)
+        if bidding.any():
+            indices[bidding] = sample_indices(bid_logits[bidding], uniforms[bidding])
+        if not bidding.all():
+            play = ~bidding
+            indices[play] = sample_indices(card_logits[play], uniforms[play])
+
+        actions: list[BidAction | PlayCardAction] = []
+        for player, is_bid, action_index in zip(players, bidding, indices):
+            if is_bid:
+                actions.append(BidAction(player, int(action_index)))
+            else:
+                actions.append(PlayCardAction(player, card_from_id(int(action_index))))
+        return actions
+
+    def _actions_from_output(
+        self,
+        output,
+        *,
+        phases: list[Phase],
+        players: list[int],
+        rngs: list[random.Random],
+    ) -> list[BidAction | PlayCardAction]:
         bid_mask = torch.tensor(
             [phase == Phase.BIDDING for phase in phases],
             dtype=torch.bool,
@@ -535,6 +651,9 @@ class ModelPolicy:
             )
             for observation in observations
         ]
+        return encoded, self.predict_encoded(encoded, need_owner=need_owner)
+
+    def predict_encoded(self, encoded, *, need_owner: bool = True):
         inference_rows = encoded
         if self.device.type == "mps" and self.precision != "fp32":
             padded_size = _inference_bucket(len(encoded))
@@ -546,13 +665,39 @@ class ModelPolicy:
         batch = encoded_observations_to_batch(
             inference_rows,
             device=self.device,
+            event_length_buckets=self.event_length_buckets,
+            packing=self.batch_packing,
         )
-        with torch.no_grad(), model_autocast(self.device, self.precision):
+        with torch.inference_mode(), model_autocast(self.device, self.precision):
             output = self.model(batch, need_owner=need_owner)
         if len(inference_rows) != len(encoded):
             output = slice_model_output(output, len(encoded))
-        self.forward_passes += len(observations)
-        return encoded, output
+        self.forward_passes += len(encoded)
+        return output
+
+    def predict_policy_encoded(self, encoded):
+        """Run the action-only model path for inference policies."""
+
+        inference_rows = encoded
+        if self.device.type == "mps" and self.precision != "fp32":
+            padded_size = _inference_bucket(len(encoded))
+            if padded_size > len(encoded):
+                inference_rows = [
+                    *encoded,
+                    *([encoded[-1]] * (padded_size - len(encoded))),
+                ]
+        batch = encoded_observations_to_batch(
+            inference_rows,
+            device=self.device,
+            event_length_buckets=self.event_length_buckets,
+            packing=self.batch_packing,
+        )
+        with torch.inference_mode(), model_autocast(self.device, self.precision):
+            output = self.model.forward_policy(batch)
+        if len(inference_rows) != len(encoded):
+            output = slice_model_output(output, len(encoded))
+        self.forward_passes += len(encoded)
+        return output
 
     def reset_counters(self) -> None:
         self.forward_passes = 0

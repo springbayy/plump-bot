@@ -11,9 +11,16 @@
       <section id="setup" class="setup">
         <div>
           <p class="eyebrow">Plump</p>
-          <h1>Play a round</h1>
+          <h1>Play Plump</h1>
         </div>
         <form id="setup-form" class="setup-grid">
+          <label>
+            Game type
+            <select name="mode" id="game-mode">
+              <option value="round">Single round</option>
+              <option value="game" selected>Full game</option>
+            </select>
+          </label>
           <label>
             Opponents
             <select name="opponents" id="opponents">
@@ -22,40 +29,59 @@
               <option value="4">4 opponents</option>
             </select>
           </label>
-          <label>
+          <label id="single-round-field" class="hidden">
             Cards this round
             <input name="hand_size" id="hand-size" type="number" min="3" max="10" value="5" />
           </label>
+          <label id="maximum-round-field">
+            Highest round
+            <input name="max_hand_size" id="max-hand-size" type="number" min="5" max="10" value="10" />
+          </label>
+          <label id="minimum-round-field">
+            Lowest round
+            <input name="min_hand_size" id="min-hand-size" type="number" min="3" max="9" value="3" />
+          </label>
           <label>
-            Your bid order
+            Your first-round bid order
             <select name="bid_position" id="bid-position"></select>
           </label>
           <label>
             Seed
             <input name="seed" type="number" placeholder="random" />
           </label>
-          <button class="primary" type="submit">Start Round</button>
+          <label class="checkbox-field probability-toggle">
+            <input name="show_probabilities" id="show-probabilities" type="checkbox" checked />
+            <span><strong>Show action probabilities</strong><small>Display the model's decimal probability on every legal bid and card.</small></span>
+          </label>
+          <button id="start-button" class="primary" type="submit">Start Full Game</button>
         </form>
       </section>
 
       <section id="table" class="table hidden">
         <header class="topbar">
           <div>
-            <p class="eyebrow">Current Round</p>
+            <p id="round-eyebrow" class="eyebrow">Current Round</p>
             <h1 id="phase-title">Bidding</h1>
           </div>
           <div class="stats">
+            <label class="live-probability-toggle" title="Show or hide model action probabilities">
+              <input id="live-probabilities" type="checkbox" />
+              <span>Probabilities</span>
+            </label>
+            <span id="round-pill" class="pill">Round</span>
             <span id="trump-pill" class="pill">Trump</span>
             <span id="hand-pill" class="pill">Cards</span>
             <span id="turn-pill" class="pill strong">Turn</span>
           </div>
         </header>
 
+        <section id="schedule" class="schedule" aria-label="Game schedule"></section>
+
         <section class="layout">
           <aside class="panel players-panel">
             <div class="panel-head">
               <h2>Players</h2>
-              <button id="new-round" class="icon-button" title="Start another round">↻</button>
+              <button id="new-round" class="icon-button" title="Start another game">↻</button>
             </div>
             <div id="players" class="players"></div>
           </aside>
@@ -82,6 +108,14 @@
 
           <aside class="panel log-panel">
             <div class="panel-head">
+              <h2>Scoreboard</h2>
+            </div>
+            <div id="scoreboard" class="scoreboard"></div>
+            <div class="panel-head history-head">
+              <h2>Round Results</h2>
+            </div>
+            <div id="round-results" class="round-results"></div>
+            <div class="panel-head history-head">
               <h2>History</h2>
             </div>
             <div id="messages" class="messages"></div>

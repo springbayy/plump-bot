@@ -5,6 +5,7 @@ description = "Plump game engine and neural model architecture."
 requires-python = ">=3.11,<3.13"
 dependencies = [
     "matplotlib>=3.10.9",
+    "modal>=1.5.2",
     "numpy>=2.0",
     "torch>=2.13.0.dev0; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]

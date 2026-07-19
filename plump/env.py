@@ -458,7 +458,11 @@ class PlumpEnv:
         return trick if trick.winner is None else None
 
     def _result(self, rewards: dict[int, int], info: Optional[dict[str, object]] = None) -> StepResult:
-        observation = None if self.is_done() else self.get_observation(self.current_player())
+        observation = (
+            None
+            if self.is_done() or self.state.current_player is None
+            else self.get_observation(self.current_player())
+        )
         return StepResult(
             state=self.state,
             observation=observation,

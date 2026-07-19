@@ -2,18 +2,23 @@ import csv
 import copy
 import dataclasses
 import math
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
-from plump.modeling import ModelConfig, SCHEMA_VERSION
+from plump.env import PlumpEnv
+from plump.modeling import ModelConfig, SCHEMA_VERSION, encode_observation
 from plump.modeling.torch_model import (
     PlumpTransformerModel,
     encoded_observations_to_batch,
 )
-from plump.policies import RandomPolicy
+from plump.policies import ModelPolicy, RandomPolicy
+from plump.rounds import RoundSpec, round_game_config
 from plump.training import (
     PPOTrainer,
     PositionBaseline,
@@ -25,11 +30,12 @@ from plump.training import (
 from plump.training.ppo import (
     _explained_variance,
     _trick_implied_relative_values,
+    solve_meta_mixture,
 )
 
 
 class TrainingTest(unittest.TestCase):
-    def _trainer(self, *, player_counts=(3,), hand_sizes=(3,)) -> PPOTrainer:
+    def _trainer(self, *, player_counts=(3,), hand_sizes=(3,), **overrides) -> PPOTrainer:
         model_config = ModelConfig(
             max_seq_len=48,
             d_model=32,
@@ -54,6 +60,7 @@ class TrainingTest(unittest.TestCase):
             seed=3,
             device="cpu",
             model_config=model_config,
+            **overrides,
         )
         return PPOTrainer(PlumpTransformerModel(model_config), config)
 
@@ -105,7 +112,7 @@ class TrainingTest(unittest.TestCase):
             mixed_fraction=0.3,
             historical_fraction=0.1,
         )
-        trainer.historical_policies.append(RandomPolicy(19))
+        trainer.add_historical_policy(RandomPolicy(19))
 
         buffer = trainer.collect_rollouts()
         arm_counts = {
@@ -143,7 +150,7 @@ class TrainingTest(unittest.TestCase):
             mixed_fraction=0.3,
             historical_fraction=0.1,
         )
-        trainer.historical_policies.append(RandomPolicy(23))
+        trainer.add_historical_policy(RandomPolicy(23))
 
         buffer = trainer.collect_rollouts()
         arms_by_episode = {
@@ -191,13 +198,13 @@ class TrainingTest(unittest.TestCase):
             places=6,
         )
 
-    def test_mixed_arm_assigns_all_three_opponent_categories(self):
+    def test_mixed_arm_seats_current_and_historical_fifty_fifty(self):
         trainer = self._trainer()
         historical = RandomPolicy(29)
-        trainer.historical_policies.append(historical)
-        categories = set()
+        trainer.add_historical_policy(historical)
+        counts = {"self": 0, "historical": 0}
 
-        for episode_id in range(100):
+        for episode_id in range(200):
             episode = trainer._new_active_episode(
                 trainer.config.specs[0],
                 "mixed",
@@ -206,13 +213,86 @@ class TrainingTest(unittest.TestCase):
             )
             for policy in episode.opponent_policies.values():
                 if policy is None:
-                    categories.add("self")
-                elif policy is trainer.heuristic_policy:
-                    categories.add("heuristic")
+                    counts["self"] += 1
                 elif policy is historical:
-                    categories.add("historical")
+                    counts["historical"] += 1
+                else:
+                    self.fail("mixed arm seated a heuristic opponent")
 
-        self.assertEqual(categories, {"self", "heuristic", "historical"})
+        total = counts["self"] + counts["historical"]
+        self.assertGreater(counts["self"], total * 0.35)
+        self.assertGreater(counts["historical"], total * 0.35)
+
+    def test_per_arm_explore_eps_overrides_fall_back_to_global(self):
+        from types import SimpleNamespace
+
+        trainer = self._trainer(
+            explore_eps_bid=0.08,
+            explore_eps_play=0.02,
+            explore_eps_by_arm={"historical": (0.25, 0.10)},
+        )
+        request = lambda arm, phase, collect=True: SimpleNamespace(
+            opponent_arm=arm,
+            phase=phase,
+            collect=collect,
+            explore_uniform=False,
+        )
+        self.assertEqual(trainer._request_explore_eps(request("historical", "bid")), 0.25)
+        self.assertEqual(trainer._request_explore_eps(request("historical", "play")), 0.10)
+        self.assertEqual(trainer._request_explore_eps(request("self", "bid")), 0.08)
+        self.assertEqual(trainer._request_explore_eps(request("mixed", "play")), 0.02)
+        # Frozen-copy seats (collect=False) always sample raw.
+        self.assertEqual(
+            trainer._request_explore_eps(request("historical", "bid", collect=False)),
+            0.0,
+        )
+
+    def test_explore_eps_by_arm_validates_arm_names_and_ranges(self):
+        with self.assertRaises(ValueError):
+            self._trainer(explore_eps_by_arm={"bogus": (0.1, 0.1)})
+        with self.assertRaises(ValueError):
+            self._trainer(explore_eps_by_arm={"self": (1.5, 0.1)})
+
+    def test_uniform_league_draws_every_member(self):
+        trainer = self._trainer(league_meta_solver="uniform")
+        for index in range(3):
+            trainer.add_historical_policy(RandomPolicy(index), snapshot_id=f"snap_{index}")
+        drawn = {
+            trainer._draw_historical_snapshot_unbatched().snapshot_id
+            for _ in range(200)
+        }
+        self.assertEqual(drawn, {"snap_0", "snap_1", "snap_2"})
+
+    def test_replace_historical_snapshots_keeps_loaded_members(self):
+        from pathlib import Path
+
+        trainer = self._trainer(league_meta_solver="uniform")
+        for index in range(1, 4):
+            trainer.add_historical_policy(
+                RandomPolicy(index),
+                snapshot_id=f"plump_v4_iter_{index:05d}",
+            )
+        kept = trainer.historical_snapshots[1]
+        trainer.replace_historical_snapshots(
+            [Path("nowhere/plump_v4_iter_00002.pt")]
+        )
+        self.assertEqual(
+            [snapshot.snapshot_id for snapshot in trainer.historical_snapshots],
+            ["plump_v4_iter_00002"],
+        )
+        self.assertIs(trainer.historical_snapshots[0], kept)
+
+    def test_mixed_arm_without_history_uses_current_policy_only(self):
+        trainer = self._trainer()
+        episode = trainer._new_active_episode(
+            trainer.config.specs[0],
+            "mixed",
+            0,
+            iteration=1,
+        )
+        self.assertTrue(
+            all(policy is None for policy in episode.opponent_policies.values())
+        )
 
     def test_rollouts_assign_residual_value_and_auxiliary_targets(self):
         trainer = self._trainer()
@@ -509,6 +589,42 @@ class TrainingTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "evaluation-only"):
                 trainer.load_checkpoint(legacy)
 
+    def test_schema_v4_optimizer_state_resumes_with_runtime_optimizations(self):
+        trainer = self._trainer()
+        trainer.update(trainer.collect_rollouts())
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint = Path(tmp) / "resume.pt"
+            trainer.save_checkpoint(checkpoint, iteration=9)
+            expected = trainer.optimizer.state_dict()
+
+            restored = self._trainer()
+            restored.config = dataclasses.replace(
+                restored.config,
+                event_length_buckets=(8, 16, 32, 64),
+                batch_packing="numpy",
+                lean_rollout_forward=True,
+                batched_league_sampling=True,
+            )
+            info = restored.load_checkpoint(checkpoint, load_optimizer=True)
+            actual = restored.optimizer.state_dict()
+
+            self.assertEqual(info["iteration"], 9)
+            self.assertTrue(info["optimizer_loaded"])
+            self.assertEqual(expected["param_groups"], actual["param_groups"])
+            self.assertEqual(set(expected["state"]), set(actual["state"]))
+            for parameter_id, expected_state in expected["state"].items():
+                actual_state = actual["state"][parameter_id]
+                self.assertEqual(set(expected_state), set(actual_state))
+                for name, expected_value in expected_state.items():
+                    actual_value = actual_state[name]
+                    if isinstance(expected_value, torch.Tensor):
+                        self.assertTrue(
+                            torch.equal(expected_value, actual_value),
+                            (parameter_id, name),
+                        )
+                    else:
+                        self.assertEqual(expected_value, actual_value)
+
     def test_logger_uses_only_v4_metrics(self):
         trainer = self._trainer()
         buffer = trainer.collect_rollouts()
@@ -524,6 +640,7 @@ class TrainingTest(unittest.TestCase):
                 timings={"iteration_sec": 1.0},
                 update=update,
                 rollout=rollout,
+                collection=trainer.last_collection_stats,
                 prediction=prediction,
                 evaluation=None,
                 checkpoint_path=Path(tmp) / "checkpoint.pt",
@@ -546,6 +663,1214 @@ class TrainingTest(unittest.TestCase):
             self.assertIn("search_bid_entropy_floor_loss", fields)
             self.assertNotIn("loss_point", fields)
             self.assertNotIn("loss_hand", fields)
+
+
+class OracleLeagueMmdTest(unittest.TestCase):
+    def _trainer(self, **overrides) -> PPOTrainer:
+        model_config = ModelConfig(
+            max_seq_len=48,
+            d_model=32,
+            n_layers=1,
+            n_heads=4,
+            d_ff=64,
+            context_hidden_dim=64,
+            dropout=0.0,
+            oracle_critic=overrides.pop("oracle_critic_model", False),
+            suit_presence_head=overrides.pop("suit_presence_head_model", False),
+        )
+        config = TrainingConfig(
+            player_counts=(3,),
+            hand_sizes=(3,),
+            rounds_per_configuration=overrides.pop(
+                "rounds_per_configuration",
+                8,
+            ),
+            num_envs=2,
+            ppo_epochs=overrides.pop("ppo_epochs", 1),
+            minibatch_size=overrides.pop("minibatch_size", 64),
+            learning_rate=1e-3,
+            self_play_fraction=overrides.pop("self_play_fraction", 0.3),
+            heuristic_fraction=overrides.pop("heuristic_fraction", 0.3),
+            mixed_fraction=overrides.pop("mixed_fraction", 0.3),
+            historical_fraction=overrides.pop("historical_fraction", 0.1),
+            historical_max_snapshots=overrides.pop(
+                "historical_max_snapshots",
+                4,
+            ),
+            league_meta_solver=overrides.pop(
+                "league_meta_solver",
+                "softmax_ema",
+            ),
+            seed=3,
+            device="cpu",
+            model_config=model_config,
+            **overrides,
+        )
+        return PPOTrainer(PlumpTransformerModel(model_config), config)
+
+    def test_oracle_critic_drives_gae_baseline_and_losses(self):
+        trainer = self._trainer(oracle_critic_model=True, oracle_critic=True)
+        trainer.add_historical_policy(RandomPolicy(11))
+
+        buffer = trainer.collect_rollouts()
+        stats = trainer.update(buffer)
+
+        self.assertTrue(math.isfinite(stats.oracle_value_loss))
+        self.assertGreater(stats.oracle_value_loss, 0.0)
+        # Oracle and plain heads are independently initialized, so the
+        # GAE baseline should not simply equal the plain residual.
+        differences = [
+            abs((sample.old_value - sample.position_intercept) - sample.old_residual_value)
+            for sample in buffer.samples
+        ]
+        self.assertGreater(max(differences), 1e-6)
+
+    def test_oracle_critic_disabled_keeps_plain_baseline_and_zero_loss(self):
+        trainer = self._trainer()
+        trainer.add_historical_policy(RandomPolicy(11))
+
+        buffer = trainer.collect_rollouts()
+        stats = trainer.update(buffer)
+
+        self.assertEqual(stats.oracle_value_loss, 0.0)
+        self.assertEqual(stats.magnet_kl, 0.0)
+        for sample in buffer.samples:
+            self.assertAlmostEqual(
+                sample.old_value - sample.position_intercept,
+                sample.old_residual_value,
+                places=5,
+            )
+
+    def test_oracle_critic_config_requires_model_head(self):
+        with self.assertRaises(ValueError):
+            self._trainer(oracle_critic=True)
+
+    def test_league_draw_prefers_harder_snapshots(self):
+        trainer = self._trainer(
+            league_temperature=1.0,
+            league_meta_solver="softmax_ema",
+        )
+        trainer.add_historical_policy(RandomPolicy(5), snapshot_id="easy")
+        trainer.add_historical_policy(RandomPolicy(7), snapshot_id="hard")
+        trainer.league_reward_ema["easy"] = 4.0
+        trainer.league_reward_ema["hard"] = -4.0
+
+        draws = [
+            trainer._draw_historical_snapshot().snapshot_id
+            for _ in range(200)
+        ]
+        self.assertGreater(draws.count("hard") / len(draws), 0.9)
+
+    def test_league_unseen_snapshot_scored_as_hardest(self):
+        trainer = self._trainer(
+            league_temperature=1.0,
+            league_meta_solver="softmax_ema",
+        )
+        trainer.add_historical_policy(RandomPolicy(5), snapshot_id="easy")
+        trainer.add_historical_policy(RandomPolicy(7), snapshot_id="new")
+        trainer.league_reward_ema["easy"] = 6.0
+
+        draws = [
+            trainer._draw_historical_snapshot().snapshot_id
+            for _ in range(200)
+        ]
+        self.assertGreater(draws.count("new") / len(draws), 0.9)
+
+    def test_batched_league_sampling_is_bounded_and_preserves_marginal(self):
+        trainer = self._trainer(
+            batched_league_sampling=True,
+            league_probe_fraction=0.10,
+            league_meta_solver="regret_matching",
+        )
+        for index, snapshot_id in enumerate(("a", "b", "c")):
+            trainer.add_historical_policy(
+                RandomPolicy(index),
+                snapshot_id=snapshot_id,
+            )
+        trainer.league_meta_mixture = {"a": 0.6, "b": 0.3, "c": 0.1}
+
+        counts = {snapshot_id: 0 for snapshot_id in ("a", "b", "c")}
+        iterations = 20_000
+        for _ in range(iterations):
+            trainer._prepare_historical_iteration_sampling()
+            available = {
+                snapshot.snapshot_id
+                for snapshot in (
+                    trainer._iteration_exploit_snapshot,
+                    trainer._iteration_probe_snapshot,
+                )
+                if snapshot is not None
+            }
+            self.assertLessEqual(len(available), 2)
+            selected = trainer._draw_historical_snapshot().snapshot_id
+            self.assertIn(selected, available)
+            counts[selected] += 1
+
+        for snapshot_id, meta_probability in trainer.league_meta_mixture.items():
+            expected = 0.9 * meta_probability + 0.1 / 3.0
+            self.assertAlmostEqual(
+                counts[snapshot_id] / iterations,
+                expected,
+                delta=0.015,
+            )
+
+    def test_batched_league_sampling_edges_and_fallback(self):
+        empty = self._trainer(
+            batched_league_sampling=True,
+            league_meta_solver="regret_matching",
+        )
+        empty._prepare_historical_iteration_sampling()
+        self.assertIsNone(empty._iteration_exploit_snapshot)
+        self.assertIsNone(empty._iteration_probe_snapshot)
+        with self.assertRaisesRegex(RuntimeError, "No historical snapshots"):
+            empty._draw_historical_snapshot()
+
+        single = self._trainer(
+            batched_league_sampling=True,
+            league_meta_solver="regret_matching",
+        )
+        single.add_historical_policy(RandomPolicy(1), snapshot_id="only")
+        single.league_meta_mixture = {"only": 1.0}
+        single._prepare_historical_iteration_sampling()
+        self.assertIs(
+            single._iteration_exploit_snapshot,
+            single._iteration_probe_snapshot,
+        )
+        self.assertEqual(
+            {single._draw_historical_snapshot().snapshot_id for _ in range(50)},
+            {"only"},
+        )
+
+        fallback = self._trainer(
+            batched_league_sampling=True,
+            league_meta_solver="softmax_ema",
+        )
+        fallback.add_historical_policy(RandomPolicy(1), snapshot_id="a")
+        fallback.add_historical_policy(RandomPolicy(2), snapshot_id="b")
+        fallback._prepare_historical_iteration_sampling()
+        self.assertIsNotNone(fallback._iteration_exploit_snapshot)
+        self.assertIsNone(fallback._iteration_probe_snapshot)
+
+    def test_collection_reports_at_most_two_historical_model_policies(self):
+        trainer = self._trainer(
+            self_play_fraction=0.0,
+            heuristic_fraction=0.0,
+            mixed_fraction=0.0,
+            historical_fraction=1.0,
+            batched_league_sampling=True,
+            league_meta_solver="regret_matching",
+        )
+        report = SimpleNamespace(macro_relative_reward=0.0)
+        with patch("plump.training.ppo.evaluate_policy", return_value=report):
+            for index, snapshot_id in enumerate(("a", "b", "c")):
+                torch.manual_seed(index + 100)
+                trainer.add_historical_policy(
+                    ModelPolicy(
+                        PlumpTransformerModel(trainer.config.model_config),
+                        device="cpu",
+                        greedy=False,
+                    ),
+                    snapshot_id=snapshot_id,
+                )
+        trainer.league_meta_mixture = {"a": 0.6, "b": 0.3, "c": 0.1}
+
+        buffer = trainer.collect_rollouts()
+        snapshot_ids = {
+            outcome.opponent_snapshot_id
+            for outcome in buffer.round_outcomes
+        }
+
+        self.assertGreater(trainer.last_collection_stats.historical_policy_count, 0)
+        self.assertLessEqual(
+            trainer.last_collection_stats.historical_policy_count,
+            2,
+        )
+        self.assertLessEqual(len(snapshot_ids), 2)
+
+    def test_collection_metrics_report_bucketing_and_lean_calls(self):
+        trainer = self._trainer(
+            self_play_fraction=1.0,
+            heuristic_fraction=0.0,
+            mixed_fraction=0.0,
+            historical_fraction=0.0,
+            event_length_buckets=(8, 16, 32, 64),
+            lean_rollout_forward=True,
+            batch_packing="numpy",
+        )
+
+        buffer = trainer.collect_rollouts()
+        stats = trainer.last_collection_stats
+
+        self.assertTrue(buffer.samples)
+        self.assertGreater(stats.total_sec, 0.0)
+        self.assertGreater(stats.current_forward_calls, 0)
+        self.assertGreater(stats.current_forward_rows, 0)
+        self.assertEqual(stats.historical_forward_calls, 0)
+        self.assertEqual(stats.historical_policy_count, 0)
+        self.assertGreaterEqual(
+            stats.processed_event_tokens,
+            stats.valid_event_tokens,
+        )
+        self.assertLess(
+            stats.processed_event_tokens,
+            stats.current_forward_rows * trainer.config.model_config.max_seq_len,
+        )
+
+    def test_historical_episodes_share_and_attribute_one_snapshot(self):
+        trainer = self._trainer()
+        trainer.add_historical_policy(RandomPolicy(5), snapshot_id="a")
+        trainer.add_historical_policy(RandomPolicy(7), snapshot_id="b")
+
+        buffer = trainer.collect_rollouts()
+        historical = [
+            outcome
+            for outcome in buffer.round_outcomes
+            if outcome.opponent_arm == "historical"
+        ]
+        self.assertTrue(historical)
+        for outcome in historical:
+            self.assertIn(outcome.opponent_snapshot_id, {"a", "b"})
+            self.assertIn(outcome.opponent_snapshot_id, trainer.league_reward_ema)
+        non_historical = [
+            outcome
+            for outcome in buffer.round_outcomes
+            if outcome.opponent_arm != "historical"
+        ]
+        for outcome in non_historical:
+            self.assertIsNone(outcome.opponent_snapshot_id)
+
+    def test_league_checkpoint_roundtrip(self):
+        trainer = self._trainer(league_meta_solver="regret_matching")
+        with tempfile.TemporaryDirectory() as tmp:
+            snapshot_path = Path(tmp) / "plump_v4_iter_00001.pt"
+            trainer.save_checkpoint(snapshot_path, iteration=1)
+            report = SimpleNamespace(macro_relative_reward=0.0)
+            with patch("plump.training.ppo.evaluate_policy", return_value=report):
+                trainer.add_historical_checkpoint(snapshot_path)
+            trainer.league_reward_ema["plump_v4_iter_00001"] = -1.25
+            members = ["heuristic", "plump_v4_iter_00001", "current"]
+            trainer.league_payoffs = {
+                (row, column): float(row_index - column_index)
+                for row_index, row in enumerate(members)
+                for column_index, column in enumerate(members)
+            }
+            trainer._refresh_league_mixture()
+            expected_payoffs = dict(trainer.league_payoffs)
+            expected_mixture = dict(trainer.league_meta_mixture)
+            checkpoint_path = Path(tmp) / "resume.pt"
+            trainer.save_checkpoint(checkpoint_path, iteration=2)
+
+            restored = self._trainer(league_meta_solver="regret_matching")
+            with patch("plump.training.ppo.evaluate_policy", return_value=report):
+                info = restored.load_checkpoint(checkpoint_path)
+
+            self.assertEqual(info["league_snapshots_loaded"], 1)
+            self.assertEqual(info["league_snapshots_missing"], [])
+            self.assertEqual(
+                [snapshot.snapshot_id for snapshot in restored.historical_snapshots],
+                ["plump_v4_iter_00001"],
+            )
+            self.assertEqual(
+                restored.league_reward_ema,
+                {"plump_v4_iter_00001": -1.25},
+            )
+            self.assertEqual(restored.league_payoffs, expected_payoffs)
+            self.assertEqual(restored.league_meta_mixture, expected_mixture)
+
+    def test_league_snapshots_restore_beside_relocated_checkpoint(self):
+        trainer = self._trainer()
+        report = SimpleNamespace(macro_relative_reward=0.0)
+        with tempfile.TemporaryDirectory() as tmp:
+            source_dir = Path(tmp) / "source"
+            source_dir.mkdir()
+            snapshot_path = source_dir / "plump_v4_iter_00001.pt"
+            trainer.save_checkpoint(snapshot_path, iteration=1)
+            with patch("plump.training.ppo.evaluate_policy", return_value=report):
+                trainer.add_historical_checkpoint(snapshot_path)
+            checkpoint_path = source_dir / "resume.pt"
+            trainer.save_checkpoint(checkpoint_path, iteration=2)
+
+            # Simulate a host migration: the run directory moves, so the
+            # absolute snapshot paths stored in the checkpoint no longer exist.
+            moved_dir = Path(tmp) / "moved"
+            moved_dir.mkdir()
+            for file in (snapshot_path, checkpoint_path):
+                shutil.move(file, moved_dir / file.name)
+
+            restored = self._trainer()
+            with patch("plump.training.ppo.evaluate_policy", return_value=report):
+                info = restored.load_checkpoint(moved_dir / "resume.pt")
+
+            self.assertEqual(info["league_snapshots_loaded"], 1)
+            self.assertEqual(info["league_snapshots_missing"], [])
+            self.assertEqual(
+                [snapshot.snapshot_id for snapshot in restored.historical_snapshots],
+                ["plump_v4_iter_00001"],
+            )
+
+    def test_rollout_model_sync_tracks_updates(self):
+        trainer = self._trainer(pipeline_rollouts=True)
+        trainer.add_historical_policy(RandomPolicy(11))
+        self.assertIsNotNone(trainer.rollout_model)
+
+        buffer = trainer.collect_rollouts()
+        trainer.update(buffer)
+
+        live = torch.cat([p.flatten() for p in trainer.model.parameters()])
+        snapshot = torch.cat(
+            [p.flatten() for p in trainer.rollout_model.parameters()]
+        )
+        self.assertFalse(torch.equal(live, snapshot))
+        trainer.sync_rollout_model()
+        snapshot = torch.cat(
+            [p.flatten() for p in trainer.rollout_model.parameters()]
+        )
+        self.assertTrue(torch.equal(live, snapshot))
+
+    def test_pipelined_collection_trains_on_stale_buffer(self):
+        from concurrent.futures import ThreadPoolExecutor
+
+        trainer = self._trainer(pipeline_rollouts=True)
+        trainer.add_historical_policy(RandomPolicy(11))
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            buffer = trainer.collect_rollouts(iteration=1)
+            future = executor.submit(trainer.collect_rollouts, iteration=2)
+            first_stats = trainer.update(buffer)
+            stale_buffer = future.result()
+            trainer.sync_rollout_model()
+            # Collected under the pre-update snapshot, trained on the updated
+            # model: the one-step staleness the pipelined loop produces.
+            stale_stats = trainer.update(stale_buffer)
+
+        self.assertEqual(
+            len(stale_buffer.round_outcomes),
+            trainer.config.rounds_per_batch,
+        )
+        for stats in (first_stats, stale_stats):
+            self.assertTrue(math.isfinite(stats.total_loss))
+            self.assertTrue(math.isfinite(stats.approx_kl))
+            self.assertGreaterEqual(stats.epochs_run, 1)
+
+    def test_act_encoded_matches_act_many(self):
+        trainer = self._trainer()
+        policy = ModelPolicy(trainer.model, device="cpu", greedy=True)
+        envs = []
+        for seed in range(4):
+            env = PlumpEnv(
+                round_game_config(RoundSpec(3, 3), bidding_start_player=0),
+                seed=seed,
+            )
+            env.reset()
+            envs.append(env)
+
+        via_envs = policy.act_many(envs)
+        players = [env.current_player() for env in envs]
+        phases = [env.phase() for env in envs]
+        encoded = [
+            encode_observation(
+                env.get_observation(player),
+                policy.model_config,
+                include_game_context=False,
+            )
+            for env, player in zip(envs, players)
+        ]
+        via_encoded = policy.act_encoded(encoded, phases=phases, players=players)
+
+        self.assertEqual(via_envs, via_encoded)
+
+    def test_env_worker_collection_produces_trainable_buffer(self):
+        from plump.training.env_workers import EnvWorkerPool
+
+        trainer = self._trainer()
+        trainer.add_historical_policy(
+            ModelPolicy(
+                PlumpTransformerModel(trainer.config.model_config),
+                device="cpu",
+                greedy=False,
+            ),
+            snapshot_id="worker_snap",
+        )
+        pool = EnvWorkerPool(
+            num_workers=2,
+            model_config=trainer.config.model_config,
+            include_game_context=False,
+            num_envs=trainer.config.num_envs,
+        )
+        try:
+            trainer.env_pool = pool
+            buffer = trainer.collect_rollouts()
+        finally:
+            trainer.env_pool = None
+            pool.close()
+
+        self.assertEqual(
+            len(buffer.round_outcomes),
+            trainer.config.rounds_per_batch,
+        )
+        self.assertEqual(
+            {outcome.opponent_arm for outcome in buffer.round_outcomes},
+            {"self", "heuristic", "mixed", "historical"},
+        )
+        stats = trainer.update(buffer)
+        self.assertTrue(math.isfinite(stats.total_loss))
+        self.assertTrue(math.isfinite(stats.approx_kl))
+        self.assertGreater(stats.samples, 0)
+
+    def test_explore_eps_records_behavior_mixture_logprobs(self):
+        # eps=1 makes the behavior policy exactly uniform-over-legal, so every
+        # recorded logprob must invert to an integer legal-action count.
+        trainer = self._trainer(explore_eps_bid=1.0, explore_eps_play=1.0)
+        trainer.add_historical_policy(RandomPolicy(11))
+
+        buffer = trainer.collect_rollouts()
+
+        sampled_bids = {
+            sample.action_index
+            for sample in buffer.samples
+            if sample.phase == "bid"
+        }
+        self.assertGreaterEqual(len(sampled_bids), 3)
+        for sample in buffer.samples:
+            n_legal = 1.0 / math.exp(sample.old_logprob)
+            self.assertAlmostEqual(n_legal, round(n_legal), places=3)
+            self.assertGreaterEqual(round(n_legal), 1)
+            self.assertIsNotNone(sample.old_policy_logprob)
+        stats = trainer.update(buffer)
+        self.assertTrue(math.isfinite(stats.approx_kl))
+        # approx_kl gates on policy movement, not on the (large by
+        # construction) policy-vs-exploration-mixture divergence.
+        self.assertLess(stats.approx_kl, 0.05)
+
+    def test_importance_weighted_kl_is_stable_for_exploratory_rare_actions(self):
+        trainer = self._trainer(explore_eps_bid=0.5, explore_eps_play=0.5)
+        trainer.add_historical_policy(RandomPolicy(11))
+        buffer = trainer.collect_rollouts()
+        rare = buffer.samples[0]
+        # This action was plausible under the exploratory behavior but had
+        # effectively zero probability under the collecting policy. The
+        # importance-weighted form must stay finite even though its naive
+        # exp(log-ratio) intermediate would overflow.
+        rare.old_policy_logprob = rare.old_logprob - 1_000.0
+
+        stats = trainer.update(buffer)
+
+        self.assertTrue(math.isfinite(stats.approx_kl))
+        self.assertTrue(math.isfinite(stats.total_loss))
+        self.assertEqual(stats.skipped_steps, 0)
+
+    def test_explore_eps_zero_keeps_policy_sampling(self):
+        trainer = self._trainer()
+        trainer.add_historical_policy(RandomPolicy(11))
+        buffer = trainer.collect_rollouts()
+        # Sharp-policy logprobs are the policy's own; nothing forces them to
+        # invert to integer counts (regression guard for the default path).
+        stats = trainer.update(buffer)
+        self.assertTrue(math.isfinite(stats.total_loss))
+
+    def test_snapshot_pool_eviction_prunes_reward_ema(self):
+        trainer = self._trainer(historical_max_snapshots=2)
+        for index in range(3):
+            trainer.add_historical_policy(
+                RandomPolicy(index),
+                snapshot_id=f"snap_{index}",
+            )
+            trainer.league_reward_ema[f"snap_{index}"] = float(index)
+
+        self.assertEqual(
+            [snapshot.snapshot_id for snapshot in trainer.historical_snapshots],
+            ["snap_1", "snap_2"],
+        )
+        self.assertEqual(set(trainer.league_reward_ema), {"snap_1", "snap_2"})
+
+    def test_mmd_magnet_kl_reported_and_magnet_tracks_model(self):
+        trainer = self._trainer(mmd_enabled=True, mmd_magnet_decay=0.5)
+        self.assertIsNotNone(trainer.magnet_model)
+        initial_magnet = copy.deepcopy(trainer.magnet_model)
+
+        buffer = trainer.collect_rollouts()
+        stats = trainer.update(buffer)
+
+        self.assertTrue(math.isfinite(stats.magnet_kl))
+        self.assertGreaterEqual(stats.magnet_kl, 0.0)
+        moved = sum(
+            float((updated - initial).abs().sum())
+            for updated, initial in zip(
+                trainer.magnet_model.parameters(),
+                initial_magnet.parameters(),
+            )
+        )
+        self.assertGreater(moved, 0.0)
+        distance_to_model = sum(
+            float((magnet - current).abs().sum())
+            for magnet, current in zip(
+                trainer.magnet_model.parameters(),
+                trainer.model.parameters(),
+            )
+        )
+        initial_distance_to_model = sum(
+            float((magnet - current).abs().sum())
+            for magnet, current in zip(
+                initial_magnet.parameters(),
+                trainer.model.parameters(),
+            )
+        )
+        self.assertLess(distance_to_model, initial_distance_to_model)
+
+    def test_suit_presence_targets_label_only_opponents(self):
+        trainer = self._trainer(suit_presence_head_model=True)
+        buffer = trainer.collect_rollouts()
+
+        for sample in buffer.samples:
+            targets = sample.suit_presence_targets
+            self.assertEqual(
+                len(targets),
+                trainer.config.model_config.max_players,
+            )
+            # Observer slot and padding players carry no labels.
+            self.assertEqual(targets[0], [-100, -100, -100, -100])
+            for relative in range(1, sample.spec.num_players):
+                self.assertTrue(
+                    all(value in (0, 1) for value in targets[relative])
+                )
+                # Three-card hands cover at most three suits, so at least
+                # one suit must be absent.
+                self.assertLess(sum(targets[relative]), 4)
+            for relative in range(
+                sample.spec.num_players,
+                trainer.config.model_config.max_players,
+            ):
+                self.assertEqual(targets[relative], [-100, -100, -100, -100])
+
+    def test_suit_presence_loss_trains_and_owner_loss_can_be_disabled(self):
+        trainer = self._trainer(
+            suit_presence_head_model=True,
+            suit_coef=0.1,
+            owner_coef=0.0,
+        )
+        buffer = trainer.collect_rollouts()
+        stats = trainer.update(buffer)
+
+        self.assertTrue(math.isfinite(stats.suit_presence_loss))
+        self.assertGreater(stats.suit_presence_loss, 0.0)
+        self.assertEqual(stats.owner_loss, 0.0)
+        self.assertEqual(stats.owner_ce_loss, 0.0)
+        self.assertEqual(stats.owner_capacity_loss, 0.0)
+
+        prediction = trainer.compute_prediction_stats(buffer, max_samples=64)
+        self.assertGreaterEqual(prediction.suit_presence_accuracy, 0.0)
+        self.assertLessEqual(prediction.suit_presence_accuracy, 1.0)
+        self.assertGreater(prediction.suit_presence_brier, 0.0)
+
+    def test_suit_presence_loss_zero_without_head(self):
+        trainer = self._trainer()
+        buffer = trainer.collect_rollouts()
+        stats = trainer.update(buffer)
+
+        self.assertEqual(stats.suit_presence_loss, 0.0)
+        self.assertGreater(stats.owner_loss, 0.0)
+
+    def test_nonfinite_gradients_skip_the_optimizer_step(self):
+        trainer = self._trainer()
+        buffer = trainer.collect_rollouts()
+        trainer.model.bid_head.weight.register_hook(
+            lambda gradient: gradient * float("nan")
+        )
+        before = copy.deepcopy(trainer.model.state_dict())
+
+        stats = trainer.update(buffer)
+
+        self.assertGreater(stats.skipped_steps, 0)
+        after = trainer.model.state_dict()
+        for key, tensor in after.items():
+            self.assertTrue(torch.isfinite(tensor).all(), key)
+            self.assertTrue(torch.equal(tensor, before[key]), key)
+
+    def test_mmd_magnet_state_persists_in_checkpoints(self):
+        trainer = self._trainer(mmd_enabled=True, mmd_magnet_decay=0.5)
+        buffer = trainer.collect_rollouts()
+        trainer.update(buffer)
+        with tempfile.TemporaryDirectory() as tmp:
+            checkpoint_path = Path(tmp) / "resume.pt"
+            trainer.save_checkpoint(checkpoint_path, iteration=1)
+
+            restored = self._trainer(mmd_enabled=True, mmd_magnet_decay=0.5)
+            restored.load_checkpoint(checkpoint_path)
+
+            distance = sum(
+                float((restored_param - trained_param).abs().sum())
+                for restored_param, trained_param in zip(
+                    restored.magnet_model.parameters(),
+                    trainer.magnet_model.parameters(),
+                )
+            )
+            self.assertEqual(distance, 0.0)
+
+    def test_regret_matching_spreads_mass_across_rps_cycle(self):
+        members = ["rock", "paper", "scissors"]
+        payoffs = {
+            ("rock", "scissors"): 1.0,
+            ("scissors", "paper"): 1.0,
+            ("paper", "rock"): 1.0,
+            ("scissors", "rock"): -1.0,
+            ("paper", "scissors"): -1.0,
+            ("rock", "paper"): -1.0,
+        }
+
+        mixture = solve_meta_mixture(members, payoffs, iterations=2_000)
+
+        for member in members:
+            self.assertAlmostEqual(mixture[member], 1.0 / 3.0, delta=0.03)
+
+    def test_regret_matching_removes_dominated_member(self):
+        members = ["a", "b", "dominated"]
+        payoffs = {
+            (row, column): (-2.0 if row == "dominated" else 1.0)
+            for row in members
+            for column in members
+        }
+
+        mixture = solve_meta_mixture(members, payoffs, iterations=2_000)
+
+        self.assertLess(mixture["dominated"], 0.01)
+
+    def test_league_caches_frozen_cells_and_refreshes_current_on_schedule(self):
+        trainer = self._trainer(
+            league_meta_solver="regret_matching",
+            league_eval_every=5,
+        )
+        report = SimpleNamespace(macro_relative_reward=0.25)
+        with patch("plump.training.ppo.evaluate_policy", return_value=report) as evaluate:
+            trainer.add_historical_policy(RandomPolicy(5), snapshot_id="a")
+            admission_calls = evaluate.call_count
+            frozen_value = trainer.league_payoffs[("a", "heuristic")]
+
+            self.assertFalse(trainer.refresh_league_payoffs(iteration=4))
+            self.assertEqual(evaluate.call_count, admission_calls)
+            self.assertTrue(trainer.refresh_league_payoffs(iteration=5))
+            self.assertGreater(evaluate.call_count, admission_calls)
+            refresh_calls = evaluate.call_count
+
+            trainer.add_historical_policy(RandomPolicy(7), snapshot_id="b")
+            self.assertGreater(evaluate.call_count, refresh_calls)
+            self.assertEqual(
+                trainer.league_payoffs[("a", "heuristic")],
+                frozen_value,
+            )
+
+    def test_league_eviction_uses_lowest_meta_mass_and_protects_newest(self):
+        trainer = self._trainer(
+            historical_max_snapshots=2,
+            league_meta_solver="regret_matching",
+        )
+        report = SimpleNamespace(macro_relative_reward=0.0)
+        with patch("plump.training.ppo.evaluate_policy", return_value=report):
+            trainer.add_historical_policy(RandomPolicy(1), snapshot_id="a")
+            trainer.add_historical_policy(RandomPolicy(2), snapshot_id="b")
+            trainer.league_meta_mixture = {
+                "heuristic": 0.1,
+                "a": 0.8,
+                "b": 0.01,
+                "current": 0.09,
+            }
+            with patch.object(trainer, "_refresh_league_mixture"):
+                trainer.add_historical_policy(RandomPolicy(3), snapshot_id="new")
+
+        self.assertEqual(
+            [row.snapshot_id for row in trainer.historical_snapshots],
+            ["a", "new"],
+        )
+        self.assertFalse(
+            any("b" in key for key in trainer.league_payoffs)
+        )
+
+    def test_target_kl_stops_after_first_high_kl_epoch(self):
+        trainer = self._trainer(ppo_epochs=4, target_kl=0.001)
+        buffer = trainer.collect_rollouts()
+        for sample in buffer.samples:
+            sample.old_logprob += 5.0
+            sample.old_policy_logprob = sample.old_logprob
+
+        stats = trainer.update(buffer)
+
+        self.assertEqual(stats.epochs_run, 1)
+        self.assertGreater(stats.approx_kl, trainer.config.target_kl)
+
+    def test_target_kl_none_runs_every_epoch(self):
+        trainer = self._trainer(ppo_epochs=3, target_kl=None)
+        buffer = trainer.collect_rollouts()
+
+        stats = trainer.update(buffer)
+
+        self.assertEqual(stats.epochs_run, 3)
+
+    def test_best_response_opponent_mix_is_pinned_and_pool_does_not_grow(self):
+        trainer = self._trainer(
+            rounds_per_configuration=4,
+            self_play_fraction=0.0,
+            heuristic_fraction=0.0,
+            mixed_fraction=0.0,
+            historical_fraction=1.0,
+            historical_max_snapshots=1,
+            league_meta_solver="softmax_ema",
+        )
+        candidate = RandomPolicy(91)
+        trainer.add_historical_policy(candidate, snapshot_id="candidate")
+
+        buffer = trainer.collect_rollouts()
+
+        self.assertEqual(len(trainer.historical_snapshots), 1)
+        self.assertTrue(
+            all(row.opponent_arm == "historical" for row in buffer.round_outcomes)
+        )
+        self.assertTrue(
+            all(
+                row.opponent_snapshot_id == "candidate"
+                for row in buffer.round_outcomes
+            )
+        )
+
+
+class WeightedSamplingTest(unittest.TestCase):
+    def _trainer(self, *, player_counts=(3,), hand_sizes=(3,), **overrides) -> PPOTrainer:
+        model_config = ModelConfig(
+            max_seq_len=48,
+            d_model=32,
+            n_layers=1,
+            n_heads=4,
+            d_ff=64,
+            context_hidden_dim=64,
+            dropout=0.0,
+        )
+        config = TrainingConfig(
+            player_counts=player_counts,
+            hand_sizes=hand_sizes,
+            rounds_per_configuration=overrides.pop("rounds_per_configuration", 1),
+            num_envs=overrides.pop("num_envs", 2),
+            ppo_epochs=1,
+            minibatch_size=64,
+            learning_rate=1e-3,
+            self_play_fraction=overrides.pop("self_play_fraction", 1.0),
+            heuristic_fraction=overrides.pop("heuristic_fraction", 0.0),
+            mixed_fraction=overrides.pop("mixed_fraction", 0.0),
+            historical_fraction=overrides.pop("historical_fraction", 0.0),
+            seed=3,
+            device="cpu",
+            model_config=model_config,
+            **overrides,
+        )
+        return PPOTrainer(PlumpTransformerModel(model_config), config)
+
+    def test_weighted_spec_quotas_follow_joint_ramp(self):
+        trainer = self._trainer(
+            player_counts=(3, 4, 5),
+            hand_sizes=(3, 4, 5),
+            rounds_per_configuration=36,
+            player_count_weights=(2.0, 3.0, 4.0),
+            hand_size_weights=(1.0, 2.0, 3.0),
+        )
+        quotas = trainer.config.spec_round_quotas()
+        self.assertEqual(sum(quotas.values()), trainer.config.rounds_per_batch)
+        # joint weight is the product; 36 rounds/config * 9 cells = 324 total,
+        # raw shares are weight/54 so every cell lands exactly on an integer
+        for spec, quota in quotas.items():
+            weight = {3: 2, 4: 3, 5: 4}[spec.num_players] * (spec.hand_size - 2)
+            self.assertEqual(quota, 324 * weight // 54)
+        # monotone: more players and more cards always get more rounds
+        self.assertLess(
+            quotas[RoundSpec(3, 3)],
+            quotas[RoundSpec(5, 5)],
+        )
+
+    def test_weighted_schedule_matches_quotas_with_exact_arm_mix(self):
+        trainer = self._trainer(
+            player_counts=(3, 4, 5),
+            hand_sizes=(3, 4, 5),
+            rounds_per_configuration=36,
+            player_count_weights=(2.0, 3.0, 4.0),
+            hand_size_weights=(1.0, 2.0, 3.0),
+            self_play_fraction=0.35,
+            mixed_fraction=0.35,
+            historical_fraction=0.30,
+            heuristic_fraction=0.0,
+        )
+        schedule = trainer.balanced_round_schedule()
+        quotas = trainer.config.spec_round_quotas()
+        counts = {}
+        arm_counts = {}
+        for spec, arm in schedule:
+            counts[spec] = counts.get(spec, 0) + 1
+            arm_counts[arm] = arm_counts.get(arm, 0) + 1
+        self.assertEqual(counts, quotas)
+        total = len(schedule)
+        # no historical snapshots loaded -> historical folds into self
+        self.assertEqual(arm_counts.get("heuristic", 0), 0)
+        self.assertEqual(arm_counts["self"], round(total * 0.65))
+        self.assertEqual(arm_counts["mixed"], round(total * 0.35))
+
+    def test_sampling_weight_validation(self):
+        with self.assertRaises(ValueError):
+            self._trainer(
+                player_counts=(3, 4, 5),
+                player_count_weights=(1.0, 2.0),
+            )
+        with self.assertRaises(ValueError):
+            self._trainer(hand_sizes=(3, 4), hand_size_weights=(0.0, 0.0))
+        with self.assertRaises(ValueError):
+            self._trainer(explore_temperature_fraction=1.5)
+        with self.assertRaises(ValueError):
+            self._trainer(
+                explore_temperature_fraction=0.5,
+                explore_temperature_bid=0.5,
+            )
+
+    def test_weighted_cells_carry_matching_gradient_mass(self):
+        trainer = self._trainer(
+            player_counts=(3,),
+            hand_sizes=(3, 4),
+            rounds_per_configuration=4,
+            num_envs=8,
+            player_count_weights=(1.0,),
+            hand_size_weights=(1.0, 3.0),
+        )
+        buffer = trainer.collect_rollouts()
+        trainer._assign_round_weights(buffer)
+        mass = {}
+        for sample in buffer.samples:
+            key = sample.spec.hand_size
+            mass[key] = mass.get(key, 0.0) + sample.round_weight
+        # per-decision mass follows cell share x steps per trajectory: every
+        # decision carries its round's weight, so the 1:3 cell shares appear
+        # as 3 * (1+4)/(1+3) once the bid+plays trajectory lengths differ
+        self.assertAlmostEqual(mass[4] / mass[3], 3.0 * 5.0 / 4.0, places=5)
+
+    def test_tempered_rounds_flatten_the_behavior_policy(self):
+        trainer = self._trainer(
+            explore_temperature_fraction=1.0,
+            explore_temperature_bid=2.0,
+            explore_temperature_play=1.5,
+        )
+        buffer = trainer.collect_rollouts()
+        self.assertTrue(buffer.samples)
+        diffs = [
+            abs(sample.old_logprob - sample.old_policy_logprob)
+            for sample in buffer.samples
+            if sample.old_policy_logprob is not None
+        ]
+        # behavior (tempered) and raw-policy logprobs must diverge somewhere
+        self.assertTrue(diffs)
+        self.assertGreater(max(diffs), 1e-4)
+        # the off-policy surrogate (clip on the policy ratio, behavior weight
+        # outside the min) must update cleanly on tempered data: before the
+        # first optimizer step the policy ratio is 1, so nothing is clipped
+        # even though behavior != policy
+        metrics = trainer.update(buffer)
+        self.assertTrue(math.isfinite(metrics.policy_loss))
+        self.assertTrue(math.isfinite(metrics.approx_kl))
+        self.assertTrue(math.isfinite(metrics.clip_fraction))
+
+    def test_temperature_fraction_zero_keeps_classic_sampling(self):
+        torch.manual_seed(11)
+        buffer_plain = self._trainer().collect_rollouts()
+        torch.manual_seed(11)
+        buffer_flagged = self._trainer(
+            explore_temperature_fraction=0.0,
+            explore_temperature_bid=2.0,
+            explore_temperature_play=1.5,
+        ).collect_rollouts()
+        self.assertEqual(
+            [sample.action_index for sample in buffer_plain.samples],
+            [sample.action_index for sample in buffer_flagged.samples],
+        )
+
+
+class CleanExploreArmsTest(unittest.TestCase):
+    def _trainer(self, *, player_counts=(3,), hand_sizes=(3,), **overrides) -> PPOTrainer:
+        model_config = ModelConfig(
+            max_seq_len=48,
+            d_model=32,
+            n_layers=1,
+            n_heads=4,
+            d_ff=64,
+            context_hidden_dim=64,
+            dropout=0.0,
+        )
+        config = TrainingConfig(
+            player_counts=player_counts,
+            hand_sizes=hand_sizes,
+            rounds_per_configuration=overrides.pop("rounds_per_configuration", 4),
+            num_envs=overrides.pop("num_envs", 4),
+            ppo_epochs=1,
+            minibatch_size=64,
+            learning_rate=1e-3,
+            self_play_fraction=overrides.pop("self_play_fraction", 0.0),
+            heuristic_fraction=overrides.pop("heuristic_fraction", 0.0),
+            mixed_fraction=overrides.pop("mixed_fraction", 0.0),
+            historical_fraction=overrides.pop("historical_fraction", 0.0),
+            seed=3,
+            device="cpu",
+            model_config=model_config,
+            **overrides,
+        )
+        return PPOTrainer(PlumpTransformerModel(model_config), config)
+
+    def _explore_noise(self) -> dict:
+        return dict(
+            explore_temperature_fraction=1.0,
+            explore_temperature_bid=3.0,
+            explore_temperature_play=2.0,
+            explore_temperature_arms=("explore_self", "explore_historical"),
+            explore_uniform_round_probability=0.3,
+            explore_noise_hand_normalized=True,
+        )
+
+    def test_explore_fractions_fold_without_history(self):
+        trainer = self._trainer(
+            self_play_fraction=0.30,
+            historical_fraction=0.30,
+            explore_self_fraction=0.20,
+            explore_historical_fraction=0.20,
+        )
+        fractions = trainer._effective_arm_fractions()
+        self.assertAlmostEqual(fractions["self"], 0.60)
+        self.assertAlmostEqual(fractions["explore_self"], 0.40)
+        self.assertEqual(fractions["historical"], 0.0)
+        self.assertEqual(fractions["explore_historical"], 0.0)
+        # With a pool present, the configured split stands.
+        trainer.historical_snapshots.append(
+            SimpleNamespace(policy=object(), snapshot_id="fake")
+        )
+        fractions = trainer._effective_arm_fractions()
+        self.assertAlmostEqual(fractions["historical"], 0.30)
+        self.assertAlmostEqual(fractions["explore_historical"], 0.20)
+
+    def test_explore_self_trains_focal_only_with_noised_behavior(self):
+        trainer = self._trainer(
+            explore_self_fraction=1.0,
+            rounds_per_configuration=6,
+            **self._explore_noise(),
+        )
+        buffer = trainer.collect_rollouts()
+        # Only the focal seat produces samples: exactly bid + hand_size
+        # decisions per round, not seats x trajectory.
+        self.assertEqual(len(buffer.samples), 6 * (1 + 3))
+        players_by_episode: dict[int, set[int]] = {}
+        for sample in buffer.samples:
+            players_by_episode.setdefault(sample.episode_id, set()).add(
+                sample.acting_player
+            )
+        self.assertTrue(
+            all(len(players) == 1 for players in players_by_episode.values())
+        )
+        # The focal behavior policy is tempered+eps, never raw.
+        diffs = [
+            abs(sample.old_logprob - sample.old_policy_logprob)
+            for sample in buffer.samples
+            if sample.old_policy_logprob is not None
+        ]
+        self.assertEqual(len(diffs), len(buffer.samples))
+        self.assertGreater(max(diffs), 1e-4)
+        metrics = trainer.update(buffer)
+        self.assertTrue(math.isfinite(metrics.policy_loss))
+        self.assertTrue(math.isfinite(metrics.approx_kl))
+
+    def test_league_ema_ignores_explore_outcomes(self):
+        trainer = self._trainer(self_play_fraction=1.0)
+        outcome = dict(
+            episode_id=0,
+            spec=RoundSpec(3, 3),
+            focal_reward=5.0,
+            bid_hit_count=1,
+            bid_player_count=3,
+            bid_abs_error_mean=0.0,
+            focal_bid_hit=1,
+            focal_bid_abs_error=0.0,
+            position_rewards={},
+            opponent_snapshot_id="snap",
+        )
+        from plump.training.ppo import RoundOutcome
+
+        trainer._update_league_ema(
+            [RoundOutcome(opponent_arm="explore_historical", **outcome)]
+        )
+        self.assertNotIn("snap", trainer.league_reward_ema)
+        trainer._update_league_ema(
+            [RoundOutcome(opponent_arm="historical", **outcome)]
+        )
+        self.assertIn("snap", trainer.league_reward_ema)
+
+    def test_clean_metrics_exclude_explore_rounds(self):
+        trainer = self._trainer(
+            self_play_fraction=0.5,
+            explore_self_fraction=0.5,
+            rounds_per_configuration=8,
+            num_envs=8,
+            **self._explore_noise(),
+        )
+        buffer = trainer.collect_rollouts()
+        stats = trainer.summarize_rollout(buffer)
+        self.assertEqual(stats.self_play_rounds + stats.explore_self_rounds, 8)
+        self.assertGreater(stats.explore_self_rounds, 0)
+        # Grouped bid-hit covers only the clean cells that actually played.
+        self.assertEqual(set(stats.bid_hit_rate_by_players), {3})
+        self.assertEqual(set(stats.bid_hit_rate_by_hand_bucket), {"3_5"})
+        clean_hits = [
+            float(outcome.focal_bid_hit)
+            for outcome in buffer.round_outcomes
+            if outcome.opponent_arm == "self"
+        ]
+        self.assertAlmostEqual(
+            stats.bid_hit_rate,
+            sum(clean_hits) / len(clean_hits),
+        )
+        prediction = trainer.compute_prediction_stats(buffer, max_samples=128)
+        for value in (
+            prediction.trick_count_accuracy_bidtime,
+            prediction.trick_count_accuracy_early,
+            prediction.trick_count_accuracy_mid,
+            prediction.trick_count_accuracy_late,
+        ):
+            self.assertGreaterEqual(value, 0.0)
+            self.assertLessEqual(value, 1.0)
+        self.assertEqual(set(prediction.trick_count_accuracy_by_players), {3})
+        self.assertEqual(
+            set(prediction.trick_count_accuracy_by_hand_bucket),
+            {"3_5"},
+        )
+
+    def test_explore_uniform_injects_at_most_one_action_per_round(self):
+        trainer = self._trainer(
+            explore_self_fraction=1.0,
+            rounds_per_configuration=8,
+            num_envs=8,
+            explore_uniform_round_probability=1.0,
+        )
+        buffer = trainer.collect_rollouts()
+        diverged_by_episode: dict[int, int] = {}
+        for sample in buffer.samples:
+            diverged_by_episode.setdefault(sample.episode_id, 0)
+            if (
+                sample.old_policy_logprob is not None
+                and abs(sample.old_logprob - sample.old_policy_logprob) > 1e-6
+            ):
+                diverged_by_episode[sample.episode_id] += 1
+        # probability 1.0 and no tempering: at most one uniform-injected
+        # (behavior != policy) decision per round — zero only when the
+        # injection lands on a forced play (single legal card).
+        self.assertTrue(set(diverged_by_episode.values()) <= {0, 1})
+        self.assertIn(1, diverged_by_episode.values())
+
+    def test_hand_normalization_scales_noise_down(self):
+        trainer = self._trainer(
+            hand_sizes=(3, 10),
+            self_play_fraction=1.0,
+            explore_temperature_bid=3.0,
+            explore_temperature_play=2.0,
+            explore_noise_hand_normalized=True,
+        )
+        self.assertAlmostEqual(trainer._hand_noise_scale(3), 1.0)
+        self.assertAlmostEqual(trainer._hand_noise_scale(10), 4.0 / 11.0)
+        request = lambda phase, hand: SimpleNamespace(
+            collect=True,
+            explore_tempered=True,
+            explore_uniform=False,
+            phase=phase,
+            hand_size=hand,
+        )
+        self.assertAlmostEqual(
+            trainer._request_explore_temperature(request("bid", 3)),
+            3.0,
+        )
+        self.assertAlmostEqual(
+            trainer._request_explore_temperature(request("bid", 10)),
+            1.0 + 2.0 * 4.0 / 11.0,
+        )
+        self.assertAlmostEqual(
+            trainer._request_explore_temperature(request("play", 10)),
+            1.0 + 1.0 * 4.0 / 11.0,
+        )
+        with self.assertRaises(ValueError):
+            self._trainer(
+                self_play_fraction=1.0,
+                explore_uniform_round_probability=1.5,
+            )
+
+    def test_owner_warmup_detaches_trunk_gradients(self):
+        trainer = self._trainer(self_play_fraction=1.0, owner_coef=0.05)
+        model = trainer.model
+        env = PlumpEnv(
+            round_game_config(RoundSpec(3, 3), bidding_start_player=0),
+            seed=5,
+        )
+        env.reset()
+        observation = env.get_observation(env.current_player())
+        encoded = encode_observation(observation, model.config)
+        batch = encoded_observations_to_batch(
+            [encoded],
+            device=torch.device("cpu"),
+        )
+        for detach, expect_trunk_grad in ((True, False), (False, True)):
+            model.zero_grad(set_to_none=True)
+            output = model(batch, need_owner=True, detach_owner_trunk=detach)
+            loss = output.owner_probs.pow(2).sum()
+            loss.backward()
+            owner_grad = model.owner_card_mlp[0].weight.grad
+            self.assertIsNotNone(owner_grad)
+            self.assertGreater(float(owner_grad.abs().sum()), 0.0)
+            trunk_grad = model.final_norm.weight.grad
+            if expect_trunk_grad:
+                self.assertIsNotNone(trunk_grad)
+                self.assertGreater(float(trunk_grad.abs().sum()), 0.0)
+            else:
+                self.assertTrue(
+                    trunk_grad is None or float(trunk_grad.abs().sum()) == 0.0
+                )
+
+    def test_owner_active_since_persists_across_checkpoints(self):
+        trainer = self._trainer(
+            self_play_fraction=1.0,
+            owner_coef=0.05,
+            owner_warmup_iterations=50,
+        )
+        buffer = trainer.collect_rollouts(iteration=7)
+        trainer.update(buffer)
+        self.assertEqual(trainer.owner_active_since, 7)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ckpt.pt"
+            trainer.save_checkpoint(path, iteration=7)
+            resumed = self._trainer(
+                self_play_fraction=1.0,
+                owner_coef=0.05,
+                owner_warmup_iterations=50,
+            )
+            resumed.load_checkpoint(path)
+            self.assertEqual(resumed.owner_active_since, 7)
+
+    def test_metrics_header_migration_adds_grouped_columns(self):
+        from plump.training.run_logger import METRIC_FIELDS
+
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            old_fields = [
+                field
+                for field in METRIC_FIELDS
+                if not field.startswith("rollout_bid_hit_p")
+                and not field.startswith("pred_trick_accuracy")
+                and "explore" not in field
+            ]
+            metrics_path = log_dir / "metrics.csv"
+            with metrics_path.open("w", newline="") as file:
+                writer = csv.DictWriter(file, fieldnames=old_fields)
+                writer.writeheader()
+                writer.writerow({field: "1" for field in old_fields})
+            TrainingRunLogger(log_dir)
+            with metrics_path.open(newline="") as file:
+                reader = csv.DictReader(file)
+                self.assertEqual(reader.fieldnames, METRIC_FIELDS)
+                row = next(reader)
+            self.assertEqual(row["iteration"], "1")
+            self.assertEqual(row["rollout_bid_hit_p5"], "")
+            self.assertEqual(row["pred_trick_accuracy_bidtime"], "")
+            self.assertEqual(row["rollout_explore_self_rounds"], "")
 
 
 if __name__ == "__main__":

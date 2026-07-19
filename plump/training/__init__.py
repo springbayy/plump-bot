@@ -1,6 +1,7 @@
 """Self-play training pipeline for Plump agents."""
 
 from .ppo import (
+    CollectionStats,
     PredictionStats,
     PPOTrainer,
     PositionBaseline,
@@ -35,6 +36,7 @@ from .expert_iteration import (
 from .expert_logger import ExpertRunLogger
 
 __all__ = [
+    "CollectionStats",
     "CounterfactualSearchRouter",
     "CHECKPOINT_SCHEMA_VERSION",
     "ExpertCycle",

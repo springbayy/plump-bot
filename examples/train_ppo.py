@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import argparse
 import os
+import random
 import sys
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+from plot_training_metrics import render_metrics_plot
 from plump.evaluation import DealBank, evaluate_policy
 from plump.modeling import ModelConfig
 from plump.modeling.torch_model import PlumpTransformerModel
@@ -35,6 +39,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rounds-per-configuration", type=int, default=16)
     parser.add_argument("--num-envs", type=int, default=384)
     parser.add_argument("--ppo-epochs", type=int, default=4)
+    parser.add_argument("--target-kl", type=float, default=None)
+    parser.add_argument(
+        "--pipeline-rollouts",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--env-workers", type=int, default=0)
+    parser.add_argument("--event-length-buckets", default="")
+    parser.add_argument(
+        "--batch-packing",
+        choices=("torch", "numpy"),
+        default="torch",
+    )
+    parser.add_argument(
+        "--lean-rollout-forward",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--minibatch-size", type=int, default=1440)
     parser.add_argument("--microbatch-size", type=int, default=576)
     parser.add_argument("--lr", type=float, default=2e-5)
@@ -43,14 +65,97 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--entropy-coef", type=float, default=0.01)
     parser.add_argument("--trick-coef", type=float, default=0.1)
     parser.add_argument("--owner-coef", type=float, default=0.05)
+    # Head-only warmup after owner activation: iterations during which owner
+    # gradients are detached from the trunk (persists across resumes).
+    parser.add_argument("--owner-warmup-iters", type=int, default=0)
     parser.add_argument("--owner-capacity-coef", type=float, default=0.1)
+    parser.add_argument(
+        "--suit-presence-head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--suit-coef", type=float, default=0.1)
     parser.add_argument("--position-baseline-decay", type=float, default=0.98)
+    parser.add_argument("--explore-eps-bid", type=float, default=0.0)
+    parser.add_argument("--explore-eps-play", type=float, default=0.0)
+    # Per-arm exploration overrides as "bid,play" (e.g. "0.25,0.10"); arms
+    # without an override use the global --explore-eps values.
+    parser.add_argument("--explore-eps-self", default=None)
+    parser.add_argument("--explore-eps-heuristic", default=None)
+    parser.add_argument("--explore-eps-mixed", default=None)
+    parser.add_argument("--explore-eps-historical", default=None)
+    parser.add_argument("--explore-eps-explore-self", default=None)
+    parser.add_argument("--explore-eps-explore-historical", default=None)
+    # Trajectory-diversity temperatures: this fraction of rounds in
+    # --explore-temp-arms sample the current policy from softmax(logits/T)
+    # (behavior-policy only; PPO stays importance-correct via the recorded
+    # mixture logprob).
+    parser.add_argument("--explore-temp-fraction", type=float, default=0.0)
+    parser.add_argument("--explore-temp-bid", type=float, default=1.0)
+    parser.add_argument("--explore-temp-play", type=float, default=1.0)
+    parser.add_argument("--explore-temp-arms", default="self,mixed")
+    # At most one uniform-random focal action per explore round, injected
+    # with this probability; placement uniform over the round's decisions.
+    parser.add_argument("--explore-uniform-round-prob", type=float, default=0.0)
+    # Shrink explore temperature + uniform probability on longer rounds by
+    # (min_hand+1)/(hand+1) so per-round distortion stays roughly constant.
+    parser.add_argument(
+        "--explore-noise-hand-normalized",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    # Per-value sampling weights aligned with --player-counts / --hand-sizes
+    # (normalized internally; empty = uniform cells).
+    parser.add_argument("--player-count-weights", default="")
+    parser.add_argument("--hand-size-weights", default="")
     parser.add_argument("--self-play-fraction", type=float, default=0.3)
     parser.add_argument("--heuristic-fraction", type=float, default=0.3)
     parser.add_argument("--mixed-fraction", type=float, default=0.3)
     parser.add_argument("--historical-fraction", type=float, default=0.1)
+    # Explore arms: noised focal seat vs frozen raw opponents (current
+    # weights / league snapshots); only the focal seat produces samples.
+    parser.add_argument("--explore-self-fraction", type=float, default=0.0)
+    parser.add_argument("--explore-historical-fraction", type=float, default=0.0)
     parser.add_argument("--historical-checkpoint", action="append", default=[])
     parser.add_argument("--historical-max-snapshots", type=int, default=4)
+    parser.add_argument("--league-temperature", type=float, default=2.0)
+    parser.add_argument("--league-reward-decay", type=float, default=0.95)
+    parser.add_argument(
+        "--batched-league-sampling",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--league-probe-fraction", type=float, default=0.10)
+    parser.add_argument(
+        "--league-meta-solver",
+        choices=("softmax_ema", "regret_matching", "uniform"),
+        default="regret_matching",
+    )
+    parser.add_argument(
+        "--league-uniform-min-iteration",
+        type=int,
+        default=None,
+        help=(
+            "Uniform league: on every checkpoint save, resample the whole "
+            "historical pool uniformly from saved checkpoints at or after "
+            "this iteration (pool size = --historical-max-snapshots)."
+        ),
+    )
+    parser.add_argument("--league-eval-every", type=int, default=50)
+    parser.add_argument("--league-eval-deals-per-configuration", type=int, default=2)
+    parser.add_argument(
+        "--oracle-critic",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--oracle-value-coef", type=float, default=0.5)
+    parser.add_argument(
+        "--mmd-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--mmd-coef", type=float, default=0.05)
+    parser.add_argument("--mmd-magnet-decay", type=float, default=0.995)
     parser.add_argument(
         "--historical-current-snapshots",
         action=argparse.BooleanOptionalAction,
@@ -103,11 +208,38 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--diag-every", type=int, default=5)
     parser.add_argument("--diag-samples", type=int, default=2048)
     parser.add_argument("--diag-batch-size", type=int, default=256)
+    parser.add_argument("--plot-every", type=int, default=5)
     return parser.parse_args()
+
+
+def _uniform_league_draw(
+    checkpoint_dir: Path,
+    min_iteration: int,
+    pool_size: int,
+    seed: int,
+) -> list[Path]:
+    """Uniform pool draw over all saved checkpoints at/after min_iteration.
+
+    Seeded by (run seed, current iteration) so a resumed run redraws the same
+    pool at the same point, but every refresh is an independent sample.
+    """
+
+    candidates = sorted(
+        path
+        for path in checkpoint_dir.glob("plump_v4_iter_*.pt")
+        if int(path.stem.rsplit("_", 1)[1]) >= min_iteration
+    )
+    if len(candidates) <= pool_size:
+        return candidates
+    return random.Random(seed).sample(candidates, pool_size)
 
 
 def _csv_ints(value: str) -> tuple[int, ...]:
     return tuple(int(item.strip()) for item in value.split(",") if item.strip())
+
+
+def _csv_floats(value: str) -> tuple[float, ...]:
+    return tuple(float(item.strip()) for item in value.split(",") if item.strip())
 
 
 def main() -> None:
@@ -115,6 +247,7 @@ def main() -> None:
     player_counts = _csv_ints(args.player_counts)
     hand_sizes = _csv_ints(args.hand_sizes)
     game_schedule = _csv_ints(args.game_schedule)
+    event_length_buckets = _csv_ints(args.event_length_buckets)
     initialization_paths = [
         args.resume_from,
         args.warm_start_v2,
@@ -138,6 +271,8 @@ def main() -> None:
         context_hidden_dim=args.context_hidden_dim,
         owner_sinkhorn_iterations=args.owner_sinkhorn_iterations,
         dropout=args.dropout,
+        oracle_critic=args.oracle_critic,
+        suit_presence_head=args.suit_presence_head,
     )
     train_config = TrainingConfig(
         player_counts=player_counts,
@@ -146,6 +281,12 @@ def main() -> None:
         games_per_player_seat=args.games_per_player_seat,
         num_envs=args.num_envs,
         ppo_epochs=args.ppo_epochs,
+        target_kl=args.target_kl,
+        pipeline_rollouts=args.pipeline_rollouts,
+        env_workers=args.env_workers,
+        event_length_buckets=event_length_buckets,
+        batch_packing=args.batch_packing,
+        lean_rollout_forward=args.lean_rollout_forward,
         minibatch_size=args.minibatch_size,
         microbatch_size=args.microbatch_size or None,
         learning_rate=args.lr,
@@ -154,15 +295,57 @@ def main() -> None:
         entropy_coef=args.entropy_coef,
         trick_coef=args.trick_coef,
         owner_coef=args.owner_coef,
+        owner_warmup_iterations=args.owner_warmup_iters,
         owner_capacity_coef=args.owner_capacity_coef,
+        suit_coef=args.suit_coef,
         max_grad_norm=args.max_grad_norm,
+        explore_eps_bid=args.explore_eps_bid,
+        explore_eps_play=args.explore_eps_play,
+        explore_eps_by_arm={
+            arm: tuple(float(part) for part in override.split(","))
+            for arm, override in (
+                ("self", args.explore_eps_self),
+                ("heuristic", args.explore_eps_heuristic),
+                ("mixed", args.explore_eps_mixed),
+                ("historical", args.explore_eps_historical),
+                ("explore_self", args.explore_eps_explore_self),
+                ("explore_historical", args.explore_eps_explore_historical),
+            )
+            if override
+        },
+        explore_temperature_fraction=args.explore_temp_fraction,
+        explore_temperature_bid=args.explore_temp_bid,
+        explore_temperature_play=args.explore_temp_play,
+        explore_temperature_arms=tuple(
+            arm.strip()
+            for arm in args.explore_temp_arms.split(",")
+            if arm.strip()
+        ),
+        explore_uniform_round_probability=args.explore_uniform_round_prob,
+        explore_noise_hand_normalized=args.explore_noise_hand_normalized,
+        player_count_weights=_csv_floats(args.player_count_weights),
+        hand_size_weights=_csv_floats(args.hand_size_weights),
         position_baseline_decay=args.position_baseline_decay,
         self_play_fraction=args.self_play_fraction,
         heuristic_fraction=args.heuristic_fraction,
         mixed_fraction=args.mixed_fraction,
         historical_fraction=args.historical_fraction,
+        explore_self_fraction=args.explore_self_fraction,
+        explore_historical_fraction=args.explore_historical_fraction,
         historical_checkpoint_paths=tuple(args.historical_checkpoint),
         historical_max_snapshots=args.historical_max_snapshots,
+        league_temperature=args.league_temperature,
+        league_reward_decay=args.league_reward_decay,
+        batched_league_sampling=args.batched_league_sampling,
+        league_probe_fraction=args.league_probe_fraction,
+        league_meta_solver=args.league_meta_solver,
+        league_eval_every=args.league_eval_every,
+        league_eval_deals_per_configuration=args.league_eval_deals_per_configuration,
+        oracle_critic=args.oracle_critic,
+        oracle_value_coef=args.oracle_value_coef,
+        mmd_enabled=args.mmd_enabled,
+        mmd_coef=args.mmd_coef,
+        mmd_magnet_decay=args.mmd_magnet_decay,
         trick_baseline=args.trick_baseline,
         training_mode=args.training_mode,
         game_schedule=game_schedule,
@@ -196,6 +379,18 @@ def main() -> None:
         )
 
     args.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    if args.league_uniform_min_iteration is not None:
+        # Replace whatever pool the checkpoint restored (e.g. an old
+        # sliding-window league) with a uniform draw before the first
+        # collection, so the new sampling regime applies from iteration one.
+        initial_pool = _uniform_league_draw(
+            args.checkpoint_dir,
+            args.league_uniform_min_iteration,
+            args.historical_max_snapshots,
+            args.seed * 1_000_003 + start_iteration,
+        )
+        if initial_pool:
+            trainer.replace_historical_snapshots(initial_pool)
     log_dir = args.log_dir or args.checkpoint_dir
     logger = TrainingRunLogger(log_dir)
     search_router = (
@@ -226,6 +421,15 @@ def main() -> None:
         if search_enabled
         else None
     )
+    if args.env_workers > 0 and args.training_mode == "round":
+        from plump.training.env_workers import EnvWorkerPool
+
+        trainer.env_pool = EnvWorkerPool(
+            num_workers=args.env_workers,
+            model_config=model_config,
+            include_game_context=train_config.include_game_context,
+            num_envs=args.num_envs,
+        )
     logger.write_config(
         {
             "command": [Path(sys.argv[0]).name, *sys.argv[1:]],
@@ -264,12 +468,28 @@ def main() -> None:
     best_eval = float("-inf")
     started_at = time.perf_counter()
     last_checkpoint_at = started_at
+    collector = (
+        ThreadPoolExecutor(max_workers=1, thread_name_prefix="rollout-collector")
+        if args.pipeline_rollouts
+        else None
+    )
+    pending_collection: Future | None = None
+    buffer = None
 
     for iteration in range(start_iteration + 1, args.iterations + 1):
         iteration_start = time.perf_counter()
-        collect_start = time.perf_counter()
-        buffer = trainer.collect_rollouts(iteration=iteration)
-        collect_sec = time.perf_counter() - collect_start
+        if collector is None or buffer is None:
+            # Sequential mode, or priming the pipeline on the first iteration.
+            buffer = trainer.collect_rollouts(iteration=iteration)
+        collect_sec = trainer.last_collect_sec
+        if collector is not None and iteration < args.iterations:
+            # Collect the next batch from the frozen rollout snapshot while
+            # update() trains the live model; data is one policy-version stale
+            # and target-kl budgets the divergence from the collecting policy.
+            pending_collection = collector.submit(
+                trainer.collect_rollouts,
+                iteration=iteration + 1,
+            )
         rollout_stats = trainer.summarize_rollout(buffer)
 
         search_routing = (
@@ -341,6 +561,9 @@ def main() -> None:
                 device=trainer.device,
                 greedy=True,
                 precision=args.precision,
+                event_length_buckets=train_config.event_length_buckets,
+                batch_packing=train_config.batch_packing,
+                lean_action_forward=train_config.lean_rollout_forward,
                 name=f"iteration-{iteration}",
             )
             evaluation = evaluate_policy(
@@ -379,10 +602,32 @@ def main() -> None:
                     args.checkpoint_dir / "search_replay.pt",
                     gate_report_path=logger.events_path,
                 )
-            if args.historical_current_snapshots:
-                trainer.add_historical_checkpoint(checkpoint_path)
             checkpoint_sec = time.perf_counter() - checkpoint_start
             last_checkpoint_at = time.perf_counter()
+
+        # Pipeline sync point: league membership, payoff refreshes, and the
+        # rollout snapshot must only change while no collection is in flight.
+        next_buffer = None
+        if pending_collection is not None:
+            next_buffer = pending_collection.result()
+            pending_collection = None
+        if checkpoint_path is not None:
+            if args.league_uniform_min_iteration is not None:
+                pool = _uniform_league_draw(
+                    args.checkpoint_dir,
+                    args.league_uniform_min_iteration,
+                    args.historical_max_snapshots,
+                    args.seed * 1_000_003 + iteration,
+                )
+                if pool:
+                    trainer.replace_historical_snapshots(pool)
+            elif args.historical_current_snapshots:
+                trainer.add_historical_checkpoint(
+                    checkpoint_path,
+                    mirrors_current=True,
+                )
+        trainer.refresh_league_payoffs(iteration=iteration)
+        trainer.sync_rollout_model()
 
         timings = {
             "collect_sec": collect_sec,
@@ -398,12 +643,34 @@ def main() -> None:
             timings=timings,
             update=update_stats,
             rollout=rollout_stats,
+            collection=trainer.last_collection_stats,
             prediction=prediction_stats,
             evaluation=evaluation,
             checkpoint_path=checkpoint_path,
             search_routing=search_routing,
             search_updates=search_updates,
+            league=trainer.league_reward_ema,
+            league_mixture=trainer.league_meta_mixture,
+            league_payoffs=trainer.league_payoffs,
         )
+
+        if args.plot_every > 0 and iteration % args.plot_every == 0:
+            try:
+                render_metrics_plot(
+                    metrics_path=logger.metrics_path,
+                    output_path=log_dir / "metrics.png",
+                    smooth=50,
+                    diagnostic_smooth=50,
+                )
+            except Exception as error:  # pragma: no cover - plotting is best-effort
+                print(f"metrics plot failed: {error}")
+
+        buffer = next_buffer
+
+    if collector is not None:
+        collector.shutdown(wait=True)
+    if trainer.env_pool is not None:
+        trainer.env_pool.close()
 
 
 if __name__ == "__main__":

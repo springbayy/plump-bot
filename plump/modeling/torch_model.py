@@ -5,7 +5,9 @@ from __future__ import annotations
 import math
 from contextlib import nullcontext
 from dataclasses import dataclass, fields, replace
-from typing import Mapping, Sequence
+from typing import Literal, Mapping, Sequence
+
+import numpy as np
 
 try:
     import torch
@@ -31,6 +33,7 @@ class ModelBatch:
     event_valid_mask: Tensor
     context_features: Tensor
     game_context_mask: Tensor
+    has_game_context: bool
     player_features: Tensor
     active_player_mask: Tensor
     legal_bid_mask: Tensor
@@ -43,6 +46,25 @@ class ModelBatch:
     schedule_hand_sizes: Tensor
     schedule_statuses: Tensor
     schedule_valid_mask: Tensor
+    event_length: int
+    max_valid_event_length: int
+
+
+@dataclass
+class PolicyModelOutput:
+    """The action-head slice needed by inference-only policies."""
+
+    masked_bid_logits: Tensor
+    masked_card_logits: Tensor
+
+
+@dataclass
+class RolloutModelOutput(PolicyModelOutput):
+    """The model outputs required while collecting trainable trajectories."""
+
+    value: Tensor
+    oracle_value: Tensor | None
+    masked_trick_count_logits: Tensor
 
 
 @dataclass
@@ -66,6 +88,11 @@ class PlumpModelOutput:
     owner_probs: Tensor | None
     hit_bid_probs: Tensor
     score_probs: Tensor
+    # Privileged training-only value; None unless the oracle critic head
+    # exists and ground-truth owner targets were passed to the forward.
+    oracle_value: Tensor | None = None
+    # Per relative player and suit: logit that the player holds the suit.
+    suit_presence_logits: Tensor | None = None
     bid_q_values: Tensor | None = None
     card_q_values: Tensor | None = None
     masked_bid_q_values: Tensor | None = None
@@ -98,53 +125,212 @@ def encoded_observations_to_batch(
     observations: Sequence[EncodedObservation],
     *,
     device: torch.device | str | None = None,
+    event_length_buckets: Sequence[int] = (),
+    packing: Literal["torch", "numpy"] = "torch",
 ) -> ModelBatch:
     if not observations:
         raise ValueError("Cannot build a batch from zero observations.")
+    if packing not in {"torch", "numpy"}:
+        raise ValueError("packing must be 'torch' or 'numpy'.")
+    buckets = tuple(int(bucket) for bucket in event_length_buckets)
+    if any(bucket <= 0 for bucket in buckets) or tuple(sorted(set(buckets))) != buckets:
+        raise ValueError("event_length_buckets must be unique positive values in ascending order.")
+    padded_event_length = len(observations[0].event_tokens)
+    if any(len(observation.event_tokens) != padded_event_length for observation in observations):
+        raise ValueError("Encoded observations in one batch must share a padded event length.")
+    max_valid_event_length = max(
+        sum(observation.event_valid_mask)
+        for observation in observations
+    )
+    event_length = padded_event_length
+    if buckets:
+        event_length = min(
+            next(
+                (bucket for bucket in buckets if bucket >= max_valid_event_length),
+                padded_event_length,
+            ),
+            padded_event_length,
+        )
+    # A context-only transformer input is valid, but retaining one masked
+    # event position gives every backend a stable non-empty event tensor.
+    event_length = max(event_length, 1)
+    for observation in observations:
+        hidden_rows = sum(any(row) for row in observation.owner_valid_mask)
+        if hidden_rows != sum(observation.owner_capacities):
+            raise ValueError(
+                "owner_capacities must sum to the hidden-card count."
+            )
     device = torch.device(device) if device is not None else best_torch_device()
+
+    def packed(values, *, dtype: torch.dtype, numpy_dtype):
+        if packing == "numpy":
+            return torch.from_numpy(np.asarray(values, dtype=numpy_dtype)).to(
+                device=device,
+            )
+        return torch.tensor(values, dtype=dtype, device=device)
+
     return ModelBatch(
-        event_tokens=torch.tensor([obs.event_tokens for obs in observations], dtype=torch.long, device=device),
-        event_valid_mask=torch.tensor([obs.event_valid_mask for obs in observations], dtype=torch.bool, device=device),
-        context_features=torch.tensor([obs.context_features for obs in observations], dtype=torch.float32, device=device),
-        game_context_mask=torch.tensor(
-            [obs.game_context_enabled for obs in observations], dtype=torch.bool, device=device
+        event_tokens=packed(
+            [obs.event_tokens[:event_length] for obs in observations],
+            dtype=torch.long,
+            numpy_dtype=np.int64,
         ),
-        player_features=torch.tensor([obs.player_features for obs in observations], dtype=torch.float32, device=device),
-        active_player_mask=torch.tensor([obs.active_player_mask for obs in observations], dtype=torch.bool, device=device),
-        legal_bid_mask=torch.tensor([obs.legal_bid_mask for obs in observations], dtype=torch.bool, device=device),
-        legal_card_mask=torch.tensor([obs.legal_card_mask for obs in observations], dtype=torch.bool, device=device),
-        final_trick_count_mask=torch.tensor(
-            [obs.final_trick_count_mask for obs in observations], dtype=torch.bool, device=device
+        event_valid_mask=packed(
+            [obs.event_valid_mask[:event_length] for obs in observations],
+            dtype=torch.bool,
+            numpy_dtype=np.bool_,
         ),
-        owner_valid_mask=torch.tensor(
-            [obs.owner_valid_mask for obs in observations], dtype=torch.bool, device=device
+        context_features=packed(
+            [obs.context_features for obs in observations],
+            dtype=torch.float32,
+            numpy_dtype=np.float32,
         ),
-        owner_capacities=torch.tensor(
+        game_context_mask=packed(
+            [obs.game_context_enabled for obs in observations],
+            dtype=torch.bool,
+            numpy_dtype=np.bool_,
+        ),
+        has_game_context=any(obs.game_context_enabled for obs in observations),
+        player_features=packed(
+            [obs.player_features for obs in observations],
+            dtype=torch.float32,
+            numpy_dtype=np.float32,
+        ),
+        active_player_mask=packed(
+            [obs.active_player_mask for obs in observations],
+            dtype=torch.bool,
+            numpy_dtype=np.bool_,
+        ),
+        legal_bid_mask=packed(
+            [obs.legal_bid_mask for obs in observations],
+            dtype=torch.bool,
+            numpy_dtype=np.bool_,
+        ),
+        legal_card_mask=packed(
+            [obs.legal_card_mask for obs in observations],
+            dtype=torch.bool,
+            numpy_dtype=np.bool_,
+        ),
+        final_trick_count_mask=packed(
+            [obs.final_trick_count_mask for obs in observations],
+            dtype=torch.bool,
+            numpy_dtype=np.bool_,
+        ),
+        owner_valid_mask=packed(
+            [obs.owner_valid_mask for obs in observations],
+            dtype=torch.bool,
+            numpy_dtype=np.bool_,
+        ),
+        owner_capacities=packed(
             [obs.owner_capacities for obs in observations],
             dtype=torch.float32,
-            device=device,
+            numpy_dtype=np.float32,
         ),
-        bid_values=torch.tensor([obs.bid_values for obs in observations], dtype=torch.long, device=device),
-        game_context_features=torch.tensor(
+        bid_values=packed(
+            [obs.bid_values for obs in observations],
+            dtype=torch.long,
+            numpy_dtype=np.int64,
+        ),
+        game_context_features=packed(
             [obs.game_context_features for obs in observations],
             dtype=torch.float32,
-            device=device,
+            numpy_dtype=np.float32,
         ),
-        schedule_hand_sizes=torch.tensor(
+        schedule_hand_sizes=packed(
             [obs.schedule_hand_sizes for obs in observations],
             dtype=torch.long,
-            device=device,
+            numpy_dtype=np.int64,
         ),
-        schedule_statuses=torch.tensor(
+        schedule_statuses=packed(
             [obs.schedule_statuses for obs in observations],
             dtype=torch.long,
-            device=device,
+            numpy_dtype=np.int64,
         ),
-        schedule_valid_mask=torch.tensor(
+        schedule_valid_mask=packed(
             [obs.schedule_valid_mask for obs in observations],
             dtype=torch.bool,
-            device=device,
+            numpy_dtype=np.bool_,
         ),
+        event_length=event_length,
+        max_valid_event_length=max_valid_event_length,
+    )
+
+
+def concat_packed_arrays(groups: Sequence[dict]) -> dict:
+    """Concatenate ``pack_encoded_rows`` dicts row-wise (C-speed, no Python loop)."""
+
+    if not groups:
+        raise ValueError("Cannot concatenate zero packed groups.")
+    if len(groups) == 1:
+        return groups[0]
+    return {
+        key: np.concatenate([group[key] for group in groups], axis=0)
+        for key in groups[0]
+    }
+
+
+def packed_arrays_to_batch(
+    arrays: dict,
+    *,
+    device: torch.device | str | None = None,
+    event_length_buckets: Sequence[int] = (),
+    float_dtype: torch.dtype | None = None,
+) -> ModelBatch:
+    """Build a ModelBatch from ``pack_encoded_rows`` output.
+
+    The numpy fast path of ``encoded_observations_to_batch`` for rows that
+    were already packed (typically inside a collector worker): the parent
+    process only slices to the event-length bucket and uploads tensors.
+    """
+
+    device = torch.device(device) if device is not None else best_torch_device()
+    buckets = tuple(int(bucket) for bucket in event_length_buckets)
+    padded_event_length = int(arrays["event_tokens"].shape[1])
+    max_valid_event_length = max(int(arrays["event_valid_counts"].max()), 0)
+    event_length = padded_event_length
+    if buckets:
+        event_length = min(
+            next(
+                (bucket for bucket in buckets if bucket >= max_valid_event_length),
+                padded_event_length,
+            ),
+            padded_event_length,
+        )
+    event_length = max(event_length, 1)
+
+    def upload(key: str, *, trim: bool = False, widen: bool = False):
+        value = arrays[key]
+        if trim and value.shape[1] > event_length:
+            value = value[:, :event_length]
+        tensor = torch.from_numpy(np.ascontiguousarray(value)).to(device=device)
+        # Transport uses int16 (pack_encoded_rows); models index with int64.
+        if widen:
+            return tensor.long()
+        # Match reduced-precision model weights (e.g. fp16-converted models).
+        if float_dtype is not None and tensor.dtype == torch.float32:
+            return tensor.to(float_dtype)
+        return tensor
+
+    return ModelBatch(
+        event_tokens=upload("event_tokens", trim=True, widen=True),
+        event_valid_mask=upload("event_valid_mask", trim=True),
+        context_features=upload("context_features"),
+        game_context_mask=upload("game_context_mask"),
+        has_game_context=bool(arrays["game_context_mask"].any()),
+        player_features=upload("player_features"),
+        active_player_mask=upload("active_player_mask"),
+        legal_bid_mask=upload("legal_bid_mask"),
+        legal_card_mask=upload("legal_card_mask"),
+        final_trick_count_mask=upload("final_trick_count_mask"),
+        owner_valid_mask=upload("owner_valid_mask"),
+        owner_capacities=upload("owner_capacities"),
+        bid_values=upload("bid_values", widen=True),
+        game_context_features=upload("game_context_features"),
+        schedule_hand_sizes=upload("schedule_hand_sizes", widen=True),
+        schedule_statuses=upload("schedule_statuses", widen=True),
+        schedule_valid_mask=upload("schedule_valid_mask"),
+        event_length=event_length,
+        max_valid_event_length=max_valid_event_length,
     )
 
 
@@ -156,6 +342,7 @@ def index_model_batch(batch: ModelBatch, indices: Tensor) -> ModelBatch:
         event_valid_mask=batch.event_valid_mask.index_select(0, indices),
         context_features=batch.context_features.index_select(0, indices),
         game_context_mask=batch.game_context_mask.index_select(0, indices),
+        has_game_context=batch.has_game_context,
         player_features=batch.player_features.index_select(0, indices),
         active_player_mask=batch.active_player_mask.index_select(0, indices),
         legal_bid_mask=batch.legal_bid_mask.index_select(0, indices),
@@ -168,10 +355,15 @@ def index_model_batch(batch: ModelBatch, indices: Tensor) -> ModelBatch:
         schedule_hand_sizes=batch.schedule_hand_sizes.index_select(0, indices),
         schedule_statuses=batch.schedule_statuses.index_select(0, indices),
         schedule_valid_mask=batch.schedule_valid_mask.index_select(0, indices),
+        event_length=batch.event_length,
+        max_valid_event_length=batch.max_valid_event_length,
     )
 
 
-def combined_action_logits(output: PlumpModelOutput, bid_mask: Tensor) -> Tensor:
+def combined_action_logits(
+    output: PlumpModelOutput | PolicyModelOutput,
+    bid_mask: Tensor,
+) -> Tensor:
     """Return one categorical action space for mixed bid and play batches."""
 
     bid_logits = F.pad(
@@ -274,6 +466,18 @@ class PlumpTransformerModel(nn.Module):
             nn.GELU(),
             nn.Linear(cfg.d_model, 1),
         )
+        if cfg.oracle_critic:
+            # One pooled card summary per ground-truth owner class. Pooling
+            # per class (not jointly) keeps the card-to-owner association;
+            # a single additive pool would collapse to public information.
+            self.oracle_value_head = nn.Sequential(
+                nn.Linear(
+                    (1 + cfg.owner_class_count) * cfg.d_model,
+                    cfg.d_model,
+                ),
+                nn.GELU(),
+                nn.Linear(cfg.d_model, 1),
+            )
 
         self.player_query_emb = nn.Embedding(cfg.max_players, cfg.d_model)
         self.player_mlp = nn.Sequential(
@@ -283,6 +487,8 @@ class PlumpTransformerModel(nn.Module):
             nn.LayerNorm(cfg.d_model),
         )
         self.trick_count_head = nn.Linear(cfg.d_model, cfg.bid_count)
+        if cfg.suit_presence_head:
+            self.suit_presence_head = nn.Linear(cfg.d_model, len(SUITS))
 
         self.owner_card_emb = nn.Embedding(NUM_CARDS, cfg.d_model)
         self.owner_card_mlp = nn.Sequential(
@@ -302,28 +508,15 @@ class PlumpTransformerModel(nn.Module):
             nn.LayerNorm(cfg.d_model),
         )
 
-    def forward(self, batch: ModelBatch, *, need_owner: bool = True) -> PlumpModelOutput:
-        self._validate_batch(batch)
-        event_emb = self._embed_events(batch.event_tokens)
-        context_emb = self.context_mlp(batch.context_features)
-        context_emb = context_emb + self.game_context_emb(batch.game_context_mask.long())
-        if bool(batch.game_context_mask.any()):
-            game_context = self.game_context_mlp(batch.game_context_features)
-            game_context = game_context + self._schedule_context(batch)
-            context_emb = context_emb + torch.where(
-                batch.game_context_mask.unsqueeze(-1),
-                game_context,
-                torch.zeros_like(game_context),
-            )
-        x = torch.cat([context_emb.unsqueeze(1), event_emb], dim=1)
-
-        context_valid = torch.ones(
-            batch.event_valid_mask.shape[0], 1, dtype=torch.bool, device=batch.event_valid_mask.device
-        )
-        padding_mask = ~torch.cat([context_valid, batch.event_valid_mask], dim=1)
-        hidden = self.transformer(x, src_key_padding_mask=padding_mask)
-        state = self.final_norm(hidden[:, 0, :])
-
+    def forward(
+        self,
+        batch: ModelBatch,
+        *,
+        need_owner: bool = True,
+        detach_owner_trunk: bool = False,
+        privileged_owner_targets: Tensor | None = None,
+    ) -> PlumpModelOutput:
+        state = self._encode_state(batch)
         bid_logits = self.bid_head(state)
         card_logits = self.card_head(state)
         masked_bid_logits = _masked_logits(bid_logits, batch.legal_bid_mask)
@@ -335,18 +528,33 @@ class PlumpTransformerModel(nn.Module):
             game_value,
             round_value,
         )
+        oracle_value = self._maybe_oracle_value(
+            state,
+            privileged_owner_targets,
+        )
 
         player_state = self._player_states(state, batch.player_features)
         trick_count_logits = self.trick_count_head(player_state)
-        masked_trick_count_logits = _masked_logits(trick_count_logits, batch.final_trick_count_mask)
+        masked_trick_count_logits = _masked_logits(
+            trick_count_logits,
+            batch.final_trick_count_mask,
+        )
+        suit_presence_logits = (
+            self.suit_presence_head(player_state)
+            if self.config.suit_presence_head
+            else None
+        )
 
         owner_logits = None
         masked_owner_logits = None
         owner_pre_sinkhorn_probs = None
         owner_probs = None
         if need_owner:
+            # Warmup for a freshly activated owner head: learn from the
+            # frozen trunk representation without pushing gradients into it.
+            owner_state = state.detach() if detach_owner_trunk else state
             owner_logits = self._owner_logits(
-                state,
+                owner_state,
                 batch.owner_capacities,
             )
             masked_owner_logits = _masked_logits(owner_logits, batch.owner_valid_mask)
@@ -383,6 +591,121 @@ class PlumpTransformerModel(nn.Module):
             owner_probs=owner_probs,
             hit_bid_probs=hit_bid_probs,
             score_probs=hit_bid_probs,
+            oracle_value=oracle_value,
+            suit_presence_logits=suit_presence_logits,
+        )
+
+    def forward_policy(self, batch: ModelBatch) -> PolicyModelOutput:
+        """Run only the shared trunk and legal action heads."""
+
+        state = self._encode_state(batch)
+        return PolicyModelOutput(
+            masked_bid_logits=_masked_logits(
+                self.bid_head(state),
+                batch.legal_bid_mask,
+            ),
+            masked_card_logits=_masked_logits(
+                self.card_head(state),
+                batch.legal_card_mask,
+            ),
+        )
+
+    def forward_rollout(
+        self,
+        batch: ModelBatch,
+        *,
+        privileged_owner_targets: Tensor | None = None,
+    ) -> RolloutModelOutput:
+        """Run the exact subset needed for trainable rollout decisions."""
+
+        state = self._encode_state(batch)
+        round_value = self.value_head(state)
+        if batch.has_game_context:
+            game_value = self.game_value_head(state)
+            value = torch.where(
+                batch.game_context_mask.unsqueeze(-1),
+                game_value,
+                round_value,
+            )
+        else:
+            value = round_value
+        player_state = self._player_states(state, batch.player_features)
+        return RolloutModelOutput(
+            masked_bid_logits=_masked_logits(
+                self.bid_head(state),
+                batch.legal_bid_mask,
+            ),
+            masked_card_logits=_masked_logits(
+                self.card_head(state),
+                batch.legal_card_mask,
+            ),
+            value=value,
+            oracle_value=self._maybe_oracle_value(
+                state,
+                privileged_owner_targets,
+            ),
+            masked_trick_count_logits=_masked_logits(
+                self.trick_count_head(player_state),
+                batch.final_trick_count_mask,
+            ),
+        )
+
+    def _encode_state(self, batch: ModelBatch) -> Tensor:
+        self._validate_batch(batch)
+        event_emb = self._embed_events(batch.event_tokens)
+        context_emb = self.context_mlp(batch.context_features)
+        context_emb = context_emb + self.game_context_emb(batch.game_context_mask.long())
+        if batch.has_game_context:
+            game_context = self.game_context_mlp(batch.game_context_features)
+            game_context = game_context + self._schedule_context(batch)
+            context_emb = context_emb + torch.where(
+                batch.game_context_mask.unsqueeze(-1),
+                game_context,
+                torch.zeros_like(game_context),
+            )
+        x = torch.cat([context_emb.unsqueeze(1), event_emb], dim=1)
+
+        context_valid = torch.ones(
+            batch.event_valid_mask.shape[0], 1, dtype=torch.bool, device=batch.event_valid_mask.device
+        )
+        padding_mask = ~torch.cat([context_valid, batch.event_valid_mask], dim=1)
+        hidden = self.transformer(x, src_key_padding_mask=padding_mask)
+        return self.final_norm(hidden[:, 0, :])
+
+    def _maybe_oracle_value(
+        self,
+        state: Tensor,
+        privileged_owner_targets: Tensor | None,
+    ) -> Tensor | None:
+        if privileged_owner_targets is not None:
+            if not self.config.oracle_critic:
+                raise ValueError(
+                    "privileged_owner_targets requires oracle_critic=True."
+                )
+            return self._oracle_value(state, privileged_owner_targets)
+        return None
+
+    def _oracle_value(self, state: Tensor, owner_targets: Tensor) -> Tensor:
+        class_count = self.config.owner_class_count
+        hidden_mask = owner_targets >= 0
+        # (B, cards, classes) one-hot of the true owner, zero for non-hidden.
+        assignment = F.one_hot(
+            owner_targets.clamp_min(0),
+            num_classes=class_count,
+        ).to(state.dtype) * hidden_mask.unsqueeze(-1).to(state.dtype)
+        card_embeddings = self.owner_card_emb(
+            torch.arange(NUM_CARDS, device=state.device)
+        )
+        pooled_by_class = torch.einsum(
+            "bck,cd->bkd",
+            assignment,
+            card_embeddings.to(state.dtype),
+        ) / assignment.sum(dim=1).clamp_min(1.0).unsqueeze(-1)
+        return self.oracle_value_head(
+            torch.cat(
+                [state, pooled_by_class.reshape(state.shape[0], -1)],
+                dim=-1,
+            )
         )
 
     def _schedule_context(self, batch: ModelBatch) -> Tensor:
@@ -509,14 +832,6 @@ class PlumpTransformerModel(nn.Module):
             self.config.owner_class_count,
         ):
             raise ValueError("owner_capacities has the wrong shape.")
-        hidden_rows = batch.owner_valid_mask.any(dim=-1).sum(dim=-1)
-        if not torch.equal(
-            hidden_rows,
-            batch.owner_capacities.sum(dim=-1).long(),
-        ):
-            raise ValueError(
-                "owner_capacities must sum to the hidden-card count."
-            )
 
 
 class PlumpSearchModel(PlumpTransformerModel):
@@ -536,8 +851,20 @@ class PlumpSearchModel(PlumpTransformerModel):
             nn.Linear(cfg.d_model, NUM_CARDS),
         )
 
-    def forward(self, batch: ModelBatch, *, need_owner: bool = True) -> PlumpModelOutput:
-        output = super().forward(batch, need_owner=need_owner)
+    def forward(
+        self,
+        batch: ModelBatch,
+        *,
+        need_owner: bool = True,
+        detach_owner_trunk: bool = False,
+        privileged_owner_targets: Tensor | None = None,
+    ) -> PlumpModelOutput:
+        output = super().forward(
+            batch,
+            need_owner=need_owner,
+            detach_owner_trunk=detach_owner_trunk,
+            privileged_owner_targets=privileged_owner_targets,
+        )
         bid_q_values = self.bid_q_head(output.state).float()
         card_q_values = self.card_q_head(output.state).float()
         return replace(
@@ -625,6 +952,18 @@ V5_Q_PARAMETER_PREFIXES = (
     "card_q_head.",
 )
 
+V4_ORACLE_PARAMETER_PREFIXES = (
+    "oracle_owner_emb.",
+    "oracle_value_head.",
+)
+
+# PPO-training-only heads that a v5 warm start may drop when the target
+# search model was not built with them.
+V4_DROPPABLE_PARAMETER_PREFIXES = (
+    *V4_ORACLE_PARAMETER_PREFIXES,
+    "suit_presence_head.",
+)
+
 
 def load_v4_weights(
     model: "PlumpSearchModel",
@@ -633,15 +972,27 @@ def load_v4_weights(
     """Warm-start a schema-v5 search model from v4 with fresh Q heads."""
 
     current = model.state_dict()
-    compatible = {
+    # PPO-training-only heads (oracle critic, suit presence) are dropped
+    # rather than migrated when the search model does not carry them.
+    dropped = sorted(
+        key
+        for key in state_dict
+        if key.startswith(V4_DROPPABLE_PARAMETER_PREFIXES) and key not in current
+    )
+    candidates = {
         key: value
         for key, value in state_dict.items()
+        if key not in dropped
+    }
+    compatible = {
+        key: value
+        for key, value in candidates.items()
         if key in current and current[key].shape == value.shape
     }
-    unexpected = sorted(key for key in state_dict if key not in current)
+    unexpected = sorted(key for key in candidates if key not in current)
     mismatched = sorted(
         key
-        for key, value in state_dict.items()
+        for key, value in candidates.items()
         if key in current and current[key].shape != value.shape
     )
     missing = sorted(key for key in current if key not in compatible)
@@ -660,7 +1011,7 @@ def load_v4_weights(
     return {
         "loaded": sorted(compatible),
         "fresh": missing,
-        "dropped": [],
+        "dropped": dropped,
     }
 
 

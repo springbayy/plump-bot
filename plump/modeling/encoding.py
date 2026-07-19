@@ -47,6 +47,8 @@ class ModelConfig:
     schedule_heads: int = 4
     owner_sinkhorn_iterations: int = 16
     dropout: float = 0.0
+    oracle_critic: bool = False
+    suit_presence_head: bool = False
 
     @property
     def bid_count(self) -> int:
@@ -781,3 +783,83 @@ def _normalize_signed(value: float, denominator: float) -> float:
     if denominator == 0:
         return 0.0
     return max(-1.0, min(1.0, float(value) / float(denominator)))
+
+
+def pack_encoded_rows(
+    observations: "list[EncodedObservation]",
+    event_length: int | None = None,
+) -> dict:
+    """Stack encoded observations into per-field numpy arrays (full padded length).
+
+    ``event_length`` (if given) trims the event fields — every row's valid\n    events must fit, which the caller guarantees by bucketing rows first.\n    Integer fields use int16 to keep pipe transport small (all token values
+    are tiny); ``packed_arrays_to_batch`` widens them on-device.
+
+    The numpy-array form is what multiprocess collectors ship over pipes:
+    building the arrays costs one Python->C conversion pass, which this way
+    runs inside the (parallel) worker that encoded the rows, while the parent
+    only concatenates and uploads. ``packed_arrays_to_batch`` in torch_model
+    turns the (possibly concatenated) dict into a ``ModelBatch``.
+    """
+
+    import numpy as np
+
+    if not observations:
+        raise ValueError("Cannot pack zero observations.")
+    if event_length is None:
+        event_length = len(observations[0].event_tokens)
+    event_length = max(event_length, 1)
+    return {
+        "event_tokens": np.asarray(
+            [obs.event_tokens[:event_length] for obs in observations],
+            dtype=np.int16,
+        ),
+        "event_valid_mask": np.asarray(
+            [obs.event_valid_mask[:event_length] for obs in observations],
+            dtype=np.bool_,
+        ),
+        "event_valid_counts": np.asarray(
+            [sum(obs.event_valid_mask) for obs in observations], dtype=np.int32
+        ),
+        "context_features": np.asarray(
+            [obs.context_features for obs in observations], dtype=np.float32
+        ),
+        "game_context_mask": np.asarray(
+            [obs.game_context_enabled for obs in observations], dtype=np.bool_
+        ),
+        "player_features": np.asarray(
+            [obs.player_features for obs in observations], dtype=np.float32
+        ),
+        "active_player_mask": np.asarray(
+            [obs.active_player_mask for obs in observations], dtype=np.bool_
+        ),
+        "legal_bid_mask": np.asarray(
+            [obs.legal_bid_mask for obs in observations], dtype=np.bool_
+        ),
+        "legal_card_mask": np.asarray(
+            [obs.legal_card_mask for obs in observations], dtype=np.bool_
+        ),
+        "final_trick_count_mask": np.asarray(
+            [obs.final_trick_count_mask for obs in observations], dtype=np.bool_
+        ),
+        "owner_valid_mask": np.asarray(
+            [obs.owner_valid_mask for obs in observations], dtype=np.bool_
+        ),
+        "owner_capacities": np.asarray(
+            [obs.owner_capacities for obs in observations], dtype=np.float32
+        ),
+        "bid_values": np.asarray(
+            [obs.bid_values for obs in observations], dtype=np.int16
+        ),
+        "game_context_features": np.asarray(
+            [obs.game_context_features for obs in observations], dtype=np.float32
+        ),
+        "schedule_hand_sizes": np.asarray(
+            [obs.schedule_hand_sizes for obs in observations], dtype=np.int16
+        ),
+        "schedule_statuses": np.asarray(
+            [obs.schedule_statuses for obs in observations], dtype=np.int16
+        ),
+        "schedule_valid_mask": np.asarray(
+            [obs.schedule_valid_mask for obs in observations], dtype=np.bool_
+        ),
+    }

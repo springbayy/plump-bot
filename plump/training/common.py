@@ -9,12 +9,19 @@ from dataclasses import dataclass
 from typing import Iterable, Literal
 
 from plump.modeling import ModelConfig, card_from_id
-from plump.modeling.encoding import NUM_CARDS
+from plump.modeling.encoding import NUM_CARDS, SUITS
 from plump.rounds import RoundSpec
 from plump.state import Bid
 
 
-OpponentArm = Literal["self", "heuristic", "mixed", "historical"]
+OpponentArm = Literal[
+    "self",
+    "heuristic",
+    "mixed",
+    "historical",
+    "explore_self",
+    "explore_historical",
+]
 PositionKey = tuple[int, int, int]
 
 
@@ -106,13 +113,15 @@ def allocate_opponent_arms(
         "heuristic",
         "mixed",
         "historical",
+        "explore_self",
+        "explore_historical",
     )
-    raw = {arm: rounds * fractions[arm] for arm in order}
+    raw = {arm: rounds * fractions.get(arm, 0.0) for arm in order}
     counts = {arm: int(math.floor(raw[arm])) for arm in order}
     remaining = rounds - sum(counts.values())
     ranked = sorted(
         order,
-        key=lambda arm: (raw[arm] - counts[arm], fractions[arm]),
+        key=lambda arm: (raw[arm] - counts[arm], fractions.get(arm, 0.0)),
         reverse=True,
     )
     for arm in ranked[:remaining]:
@@ -191,6 +200,30 @@ def owner_targets_relative(
                 "Ground-truth owner is excluded by the public owner mask."
             )
         targets[index] = target
+    return targets
+
+
+def suit_presence_targets_relative(
+    env,
+    observer_player: int,
+    model_config: ModelConfig,
+) -> list[list[int]]:
+    """Per relative opponent and suit: does their current hand hold the suit?
+
+    Relative slot 0 is the observer and is masked; padding players are masked.
+    """
+
+    round_state = env.state.current_round
+    num_players = env.config.num_players
+    targets = [
+        [-100] * len(SUITS)
+        for _ in range(model_config.max_players)
+    ]
+    for relative in range(1, num_players):
+        player = (observer_player + relative) % num_players
+        held_suits = {card.suit for card in round_state.current_hands[player]}
+        for suit_index, suit in enumerate(SUITS):
+            targets[relative][suit_index] = int(suit in held_suits)
     return targets
 
 
